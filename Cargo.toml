@@ -1,0 +1,33 @@
+[package]
+name = "pigeon-relay"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal authenticated websocket relay for Pigeon encrypted message envelopes"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+dashmap = "6"
+futures = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+humantime = "2"
+hmac = "0.12"
+jsonwebtoken = "10"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+serde_json = "1"
