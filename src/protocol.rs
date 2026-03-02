@@ -99,11 +99,11 @@ pub struct ErrorPayload {
 #[derive(Debug, Serialize)]
 pub struct EmptyPayload {}
 
-pub fn parse_payload<T>(frame: &ClientFrame) -> Result<T, serde_json::Error>
+pub fn parse_payload<T>(frame: &mut ClientFrame) -> Result<T, serde_json::Error>
 where
     T: DeserializeOwned,
 {
-    serde_json::from_value(frame.payload.clone())
+    serde_json::from_value(frame.payload.take())
 }
 
 pub fn frame_json<T>(

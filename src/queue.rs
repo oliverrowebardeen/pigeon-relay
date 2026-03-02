@@ -81,14 +81,20 @@ impl QueueStore {
 
     pub fn drain_for_recipient(&self, recipient_hash: &str) -> Vec<QueuedMessage> {
         let now = Utc::now();
-        let mut drained = Vec::new();
 
         if let Some(mut queue) = self.queues.get_mut(recipient_hash) {
-            queue.retain(|message| message.expires_at > now);
-            drained.extend(queue.iter().cloned());
+            let drained: Vec<QueuedMessage> = queue
+                .drain(..)
+                .filter(|message| message.expires_at > now)
+                .collect();
+            for msg in &drained {
+                self.dedup
+                    .remove(&Self::dedup_key(recipient_hash, msg.message_id));
+            }
+            return drained;
         }
 
-        drained
+        Vec::new()
     }
 
     pub fn ack_message(&self, recipient_hash: &str, message_id: Uuid) -> Option<QueuedMessage> {
