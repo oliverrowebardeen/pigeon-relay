@@ -322,6 +322,15 @@ async fn process_frame(
             };
 
             let b64_len = payload.envelope_b64.len();
+            if b64_len < 4 || b64_len % 4 != 0 {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "bad_payload",
+                    "envelope_b64 must be valid base64",
+                );
+                return false;
+            }
             let padding = payload.envelope_b64.as_bytes().iter().rev().take_while(|&&b| b == b'=').count();
             let decoded_len = (b64_len / 4) * 3 - padding;
 
@@ -444,6 +453,18 @@ async fn process_frame(
                 }
             };
 
+            if payload.device_token_hex.len() > 200
+                || !payload.device_token_hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "bad_payload",
+                    "device_token_hex must be valid hex",
+                );
+                return false;
+            }
+
             let apns_env = payload
                 .apns_env
                 .as_deref()
@@ -462,7 +483,7 @@ async fn process_frame(
                 PushRegistration {
                     device_token_hex: payload.device_token_hex,
                     apns_env,
-                    topic_override: payload.topic,
+                    topic_override: None,
                     last_push_at: None,
                 },
             );
