@@ -1,4 +1,5 @@
 use std::env;
+use std::str::FromStr;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -34,6 +35,18 @@ pub enum ApnsEnvironment {
     Production,
 }
 
+impl FromStr for ApnsEnvironment {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "production" => Ok(Self::Production),
+            "sandbox" => Ok(Self::Sandbox),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid duration for {name}: {value}")]
@@ -48,11 +61,11 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let relay_addr = env_var_or_default("RELAY_ADDR", "0.0.0.0:8080");
         let message_ttl = parse_duration("RELAY_MESSAGE_TTL", "168h")?;
-        let max_message_bytes = parse_usize("RELAY_MAX_MESSAGE_BYTES", "65536")?;
-        let max_queue_per_recipient = parse_usize("RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
+        let max_message_bytes = parse_num("RELAY_MAX_MESSAGE_BYTES", "65536")?;
+        let max_queue_per_recipient = parse_num("RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
         let challenge_ttl = parse_duration("RELAY_CHALLENGE_TTL", "30s")?;
         let session_ttl = parse_duration("RELAY_SESSION_TTL", "24h")?;
-        let rate_limit_per_min = parse_u32("RELAY_RATE_LIMIT_PER_MIN", "60")?;
+        let rate_limit_per_min = parse_num("RELAY_RATE_LIMIT_PER_MIN", "60")?;
         let ping_interval = parse_duration("RELAY_PING_INTERVAL", "25s")?;
         let pong_timeout = parse_duration("RELAY_PONG_TIMEOUT", "60s")?;
 
@@ -107,17 +120,10 @@ fn parse_duration(name: &'static str, default: &'static str) -> Result<Duration,
     humantime::parse_duration(&value).map_err(|_| ConfigError::InvalidDuration { name, value })
 }
 
-fn parse_usize(name: &'static str, default: &'static str) -> Result<usize, ConfigError> {
+fn parse_num<T: FromStr>(name: &'static str, default: &'static str) -> Result<T, ConfigError> {
     let value = env_var_or_default(name, default);
     value
-        .parse::<usize>()
-        .map_err(|_| ConfigError::InvalidInteger { name, value })
-}
-
-fn parse_u32(name: &'static str, default: &'static str) -> Result<u32, ConfigError> {
-    let value = env_var_or_default(name, default);
-    value
-        .parse::<u32>()
+        .parse::<T>()
         .map_err(|_| ConfigError::InvalidInteger { name, value })
 }
 
@@ -129,8 +135,7 @@ fn parse_bool(name: &'static str, default: bool) -> bool {
 }
 
 fn parse_apns_environment(value: Option<String>) -> ApnsEnvironment {
-    match value.as_deref().map(|v| v.to_ascii_lowercase()).as_deref() {
-        Some("production") => ApnsEnvironment::Production,
-        _ => ApnsEnvironment::Sandbox,
-    }
+    value
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default()
 }

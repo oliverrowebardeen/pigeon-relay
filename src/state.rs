@@ -19,11 +19,6 @@ pub struct SessionHandle {
 }
 
 #[derive(Debug, Clone)]
-pub struct PendingAck {
-    pub payload: MessageAckedPayload,
-}
-
-#[derive(Debug, Clone)]
 pub struct PushRegistration {
     pub device_token_hex: String,
     pub apns_env: ApnsEnvironment,
@@ -43,7 +38,7 @@ pub struct RelayState {
     pub queue: QueueStore,
     pub sessions: DashMap<String, SessionHandle>,
     pub challenges: DashMap<String, ChallengeRecord>,
-    pub pending_acks: DashMap<String, VecDeque<PendingAck>>,
+    pub pending_acks: DashMap<String, (Instant, VecDeque<MessageAckedPayload>)>,
     pub push_tokens: DashMap<String, PushRegistration>,
     rate_limits: DashMap<String, RateLimitWindow>,
     pub apns_client: Option<Arc<ApnsClient>>,
@@ -107,16 +102,18 @@ impl RelayState {
     }
 
     pub fn store_pending_ack(&self, sender_hash: &str, payload: MessageAckedPayload) {
-        let mut queue = self
+        let now = Instant::now();
+        let mut entry = self
             .pending_acks
             .entry(sender_hash.to_string())
-            .or_default();
-        queue.push_back(PendingAck { payload });
+            .or_insert_with(|| (now, VecDeque::new()));
+        entry.0 = now;
+        entry.1.push_back(payload);
     }
 
     pub fn take_pending_acks(&self, sender_hash: &str) -> Vec<MessageAckedPayload> {
-        if let Some((_, pending)) = self.pending_acks.remove(sender_hash) {
-            return pending.into_iter().map(|ack| ack.payload).collect();
+        if let Some((_, (_, pending))) = self.pending_acks.remove(sender_hash) {
+            return pending.into_iter().collect();
         }
         Vec::new()
     }
@@ -146,6 +143,8 @@ impl RelayState {
         self.sessions.retain(|_, session| session.expires_at > now);
         self.rate_limits
             .retain(|_, window| now.duration_since(window.started_at) <= Duration::from_secs(300));
+        self.pending_acks
+            .retain(|_, (stored_at, _)| now.duration_since(*stored_at) <= self.config.session_ttl);
 
         self.queue.purge_expired();
     }

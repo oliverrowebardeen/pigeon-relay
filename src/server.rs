@@ -6,8 +6,6 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -70,6 +68,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     });
 
     let mut authenticated_identity: Option<String> = None;
+    let mut rate_limit_key = format!("anon:{connection_id}");
     let mut last_pong = Instant::now();
     let mut ping_interval = tokio::time::interval(state.config.ping_interval);
 
@@ -101,10 +100,6 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                             continue;
                         };
 
-                        let rate_limit_key = authenticated_identity
-                            .as_ref()
-                            .map_or_else(|| format!("anon:{connection_id}"), |id| id.clone());
-
                         if !state.allow_request(&rate_limit_key) {
                             let _ = send_error(
                                 &out_tx,
@@ -119,6 +114,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                             &state,
                             &out_tx,
                             &mut authenticated_identity,
+                            &mut rate_limit_key,
                             &mut last_pong,
                             frame,
                         )
@@ -154,8 +150,9 @@ async fn process_frame(
     state: &Arc<RelayState>,
     out_tx: &mpsc::UnboundedSender<String>,
     authenticated_identity: &mut Option<String>,
+    rate_limit_key: &mut String,
     last_pong: &mut Instant,
-    frame: ClientFrame,
+    mut frame: ClientFrame,
 ) -> bool {
     match frame.frame_type.as_str() {
         "auth_hello" => {
@@ -169,7 +166,7 @@ async fn process_frame(
                 return false;
             }
 
-            let payload = match parse_payload::<AuthHelloPayload>(&frame) {
+            let payload = match parse_payload::<AuthHelloPayload>(&mut frame) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let _ = send_error(
@@ -217,7 +214,7 @@ async fn process_frame(
                 return false;
             }
 
-            let payload = match parse_payload::<AuthProvePayload>(&frame) {
+            let payload = match parse_payload::<AuthProvePayload>(&mut frame) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let _ = send_error(
@@ -263,8 +260,6 @@ async fn process_frame(
                 state.config.session_ttl,
             );
 
-            *authenticated_identity = Some(identity_hash.clone());
-
             let _ = send_frame(
                 out_tx,
                 "auth_ok",
@@ -289,6 +284,9 @@ async fn process_frame(
                 let _ = send_frame(out_tx, "msg_acked", None, pending_ack);
             }
 
+            *rate_limit_key = identity_hash.clone();
+            *authenticated_identity = Some(identity_hash);
+
             false
         }
         "msg_send" => {
@@ -302,7 +300,7 @@ async fn process_frame(
                 return false;
             };
 
-            let payload = match parse_payload::<MessageSendPayload>(&frame) {
+            let payload = match parse_payload::<MessageSendPayload>(&mut frame) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let _ = send_error(
@@ -323,20 +321,11 @@ async fn process_frame(
                 }
             };
 
-            let message_bytes = match STANDARD.decode(&payload.envelope_b64) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "bad_payload",
-                        "envelope_b64 must be valid base64",
-                    );
-                    return false;
-                }
-            };
+            let b64_len = payload.envelope_b64.len();
+            let padding = payload.envelope_b64.as_bytes().iter().rev().take_while(|&&b| b == b'=').count();
+            let decoded_len = (b64_len / 4) * 3 - padding;
 
-            if message_bytes.len() > state.config.max_message_bytes {
+            if decoded_len > state.config.max_message_bytes {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -367,7 +356,7 @@ async fn process_frame(
                     envelope_b64: payload.envelope_b64,
                     queued_at_ms: Utc::now().timestamp_millis(),
                 };
-                let _ = send_frame_to_session(
+                let _ = send_frame(
                     &recipient_session.sender,
                     "msg_deliver",
                     None,
@@ -390,7 +379,7 @@ async fn process_frame(
                 return false;
             };
 
-            let payload = match parse_payload::<MessageAckPayload>(&frame) {
+            let payload = match parse_payload::<MessageAckPayload>(&mut frame) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let _ = send_error(
@@ -418,7 +407,7 @@ async fn process_frame(
                 };
 
                 if let Some(sender_session) = state.sessions.get(&acked_message.sender_hash) {
-                    let _ = send_frame_to_session(
+                    let _ = send_frame(
                         &sender_session.sender,
                         "msg_acked",
                         None,
@@ -442,7 +431,7 @@ async fn process_frame(
                 return false;
             };
 
-            let payload = match parse_payload::<PushRegisterPayload>(&frame) {
+            let payload = match parse_payload::<PushRegisterPayload>(&mut frame) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let _ = send_error(
@@ -455,16 +444,18 @@ async fn process_frame(
                 }
             };
 
-            let apns_env = match payload.apns_env.as_deref().map(str::to_ascii_lowercase) {
-                Some(value) if value == "production" => ApnsEnvironment::Production,
-                Some(value) if value == "sandbox" => ApnsEnvironment::Sandbox,
-                _ => state
-                    .apns_client
-                    .as_ref()
-                    .map_or(ApnsEnvironment::Sandbox, |client| {
-                        client.default_environment()
-                    }),
-            };
+            let apns_env = payload
+                .apns_env
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    state
+                        .apns_client
+                        .as_ref()
+                        .map_or(ApnsEnvironment::default(), |client| {
+                            client.default_environment()
+                        })
+                });
 
             state.push_tokens.insert(
                 identity_hash.clone(),
@@ -554,18 +545,6 @@ fn send_error(
     )
 }
 
-fn send_frame_to_session<T>(
-    tx: &mpsc::UnboundedSender<String>,
-    frame_type: &'static str,
-    req_id: Option<String>,
-    payload: T,
-) -> Result<(), ()>
-where
-    T: serde::Serialize,
-{
-    let serialized = frame_json(frame_type, req_id, payload).map_err(|_| ())?;
-    tx.send(serialized).map_err(|_| ())
-}
 
 async fn purge_loop(state: Arc<RelayState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
