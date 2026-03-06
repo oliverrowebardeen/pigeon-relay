@@ -65,14 +65,23 @@ struct JwtClaims {
 }
 
 #[derive(Debug, Serialize)]
-struct SilentPushPayload {
-    aps: ApsPayload,
+struct MessagePushPayload {
+    aps: MessagePushApsPayload,
+    pigeon_type: &'static str,
 }
 
 #[derive(Debug, Serialize)]
-struct ApsPayload {
+struct MessagePushApsPayload {
     #[serde(rename = "content-available")]
     content_available: u8,
+    alert: MessagePushAlert,
+    sound: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct MessagePushAlert {
+    title: &'static str,
+    body: &'static str,
 }
 
 impl ApnsClient {
@@ -108,7 +117,7 @@ impl ApnsClient {
         })
     }
 
-    pub async fn send_silent_push(&self, request: ApnsSendRequest) -> Result<(), ApnsError> {
+    pub async fn send_message_push(&self, request: ApnsSendRequest) -> Result<(), ApnsError> {
         let jwt = self.get_or_refresh_jwt()?;
 
         let topic = request
@@ -122,19 +131,15 @@ impl ApnsClient {
 
         let url = format!("{base_url}/3/device/{}", request.device_token_hex);
 
-        let payload = SilentPushPayload {
-            aps: ApsPayload {
-                content_available: 1,
-            },
-        };
+        let payload = build_message_push_payload();
 
         let response = self
             .http_client
             .post(url)
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", topic)
-            .header("apns-push-type", "background")
-            .header("apns-priority", "5")
+            .header("apns-push-type", "alert")
+            .header("apns-priority", "10")
             .json(&payload)
             .send()
             .await
@@ -187,5 +192,47 @@ impl ApnsClient {
 
     pub fn default_environment(&self) -> ApnsEnvironment {
         self.default_environment
+    }
+}
+
+fn build_message_push_payload() -> MessagePushPayload {
+    MessagePushPayload {
+        aps: MessagePushApsPayload {
+            content_available: 1,
+            alert: MessagePushAlert {
+                title: "New Pigeon message",
+                body: "Open Pigeon to sync new messages.",
+            },
+            sound: "default",
+        },
+        pigeon_type: "relay_message",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::build_message_push_payload;
+
+    #[test]
+    fn serializes_message_push_payload_for_force_quit_delivery() {
+        let payload =
+            serde_json::to_value(build_message_push_payload()).expect("serialize APNS payload");
+
+        assert_eq!(
+            payload,
+            json!({
+                "aps": {
+                    "content-available": 1,
+                    "alert": {
+                        "title": "New Pigeon message",
+                        "body": "Open Pigeon to sync new messages."
+                    },
+                    "sound": "default"
+                },
+                "pigeon_type": "relay_message"
+            })
+        );
     }
 }

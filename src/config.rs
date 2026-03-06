@@ -135,7 +135,5 @@ fn parse_bool(name: &'static str, default: bool) -> bool {
 }
 
 fn parse_apns_environment(value: Option<String>) -> ApnsEnvironment {
-    value
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_default()
+    value.and_then(|v| v.parse().ok()).unwrap_or_default()
 }
