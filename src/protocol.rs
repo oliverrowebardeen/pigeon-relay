@@ -87,6 +87,7 @@ pub struct MessageAckedPayload {
 pub struct PushRegisterPayload {
     pub device_token_hex: String,
     pub apns_env: Option<String>,
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

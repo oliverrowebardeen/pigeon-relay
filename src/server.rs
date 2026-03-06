@@ -26,10 +26,7 @@ use crate::state::{PushRegistration, RelayState};
 pub async fn run_server(
     state: Arc<RelayState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/ws", get(ws_handler))
-        .with_state(state.clone());
+    let app = app(state.clone());
 
     tokio::spawn(purge_loop(state.clone()));
 
@@ -37,6 +34,13 @@ pub async fn run_server(
     info!(addr = %state.config.relay_addr, "relay server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn app(state: Arc<RelayState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/ws", get(ws_handler))
+        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
@@ -70,7 +74,10 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     let mut authenticated_identity: Option<String> = None;
     let mut rate_limit_key = format!("anon:{connection_id}");
     let mut last_pong = Instant::now();
-    let mut ping_interval = tokio::time::interval(state.config.ping_interval);
+    let mut ping_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + state.config.ping_interval,
+        state.config.ping_interval,
+    );
 
     loop {
         tokio::select! {
@@ -331,7 +338,13 @@ async fn process_frame(
                 );
                 return false;
             }
-            let padding = payload.envelope_b64.as_bytes().iter().rev().take_while(|&&b| b == b'=').count();
+            let padding = payload
+                .envelope_b64
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'=')
+                .count();
             let decoded_len = (b64_len / 4) * 3 - padding;
 
             if decoded_len > state.config.max_message_bytes {
@@ -365,12 +378,22 @@ async fn process_frame(
                     envelope_b64: payload.envelope_b64,
                     queued_at_ms: Utc::now().timestamp_millis(),
                 };
-                let _ = send_frame(
+                if send_frame(
                     &recipient_session.sender,
                     "msg_deliver",
                     None,
                     deliver_payload,
-                );
+                )
+                .is_err()
+                {
+                    drop(recipient_session);
+                    state.unregister_session(&payload.recipient_hash_hex);
+                    warn!(
+                        recipient = %hash_prefix(&payload.recipient_hash_hex),
+                        "live delivery failed for stale session; falling back to APNS"
+                    );
+                    maybe_trigger_apns(state, &payload.recipient_hash_hex).await;
+                }
             } else {
                 maybe_trigger_apns(state, &payload.recipient_hash_hex).await;
             }
@@ -416,12 +439,18 @@ async fn process_frame(
                 };
 
                 if let Some(sender_session) = state.sessions.get(&acked_message.sender_hash) {
-                    let _ = send_frame(
+                    if send_frame(
                         &sender_session.sender,
                         "msg_acked",
                         None,
                         ack_payload.clone(),
-                    );
+                    )
+                    .is_err()
+                    {
+                        drop(sender_session);
+                        state.unregister_session(&acked_message.sender_hash);
+                        state.store_pending_ack(&acked_message.sender_hash, ack_payload);
+                    }
                 } else {
                     state.store_pending_ack(&acked_message.sender_hash, ack_payload);
                 }
@@ -454,7 +483,10 @@ async fn process_frame(
             };
 
             if payload.device_token_hex.len() > 200
-                || !payload.device_token_hex.bytes().all(|b| b.is_ascii_hexdigit())
+                || !payload
+                    .device_token_hex
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
             {
                 let _ = send_error(
                     out_tx,
@@ -477,15 +509,28 @@ async fn process_frame(
                             client.default_environment()
                         })
                 });
+            let has_topic_override = payload
+                .topic
+                .as_ref()
+                .is_some_and(|topic| !topic.trim().is_empty());
 
             state.push_tokens.insert(
                 identity_hash.clone(),
                 PushRegistration {
                     device_token_hex: payload.device_token_hex,
                     apns_env,
-                    topic_override: None,
+                    topic_override: payload.topic.and_then(|topic| {
+                        let trimmed = topic.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    }),
                     last_push_at: None,
                 },
+            );
+            info!(
+                identity = %hash_prefix(identity_hash),
+                apns_env = ?apns_env,
+                has_topic_override,
+                "registered APNS push token"
             );
 
             false
@@ -529,11 +574,23 @@ async fn maybe_trigger_apns(state: &Arc<RelayState>, recipient_hash: &str) {
     };
 
     let apns_client = apns_client.clone();
+    let recipient_hash = recipient_hash.to_string();
     tokio::spawn(async move {
-        if let Err(error) = apns_client.send_silent_push(request).await {
-            warn!(?error, "failed to send APNS silent push");
+        info!(
+            recipient = %hash_prefix(&recipient_hash),
+            environment = ?request.environment,
+            has_topic_override = request.topic_override.is_some(),
+            "sending APNS push"
+        );
+        if let Err(error) = apns_client.send_message_push(request).await {
+            warn!(?error, "failed to send APNS message push");
         }
     });
+}
+
+fn hash_prefix(value: &str) -> &str {
+    let prefix_len = value.len().min(8);
+    &value[..prefix_len]
 }
 
 fn send_frame<T>(
@@ -566,7 +623,6 @@ fn send_error(
     )
 }
 
-
 async fn purge_loop(state: Arc<RelayState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
 
@@ -578,5 +634,339 @@ async fn purge_loop(state: Arc<RelayState>) {
             challenges = state.challenges.len(),
             "purged expired state"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use futures::{SinkExt, StreamExt};
+    use hkdf::Hkdf;
+    use hmac::{Hmac, Mac};
+    use rand::RngCore;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    use crate::auth;
+    use crate::config::{ApnsConfig, ApnsEnvironment, Config};
+
+    use super::*;
+
+    type HmacSha256 = Hmac<Sha256>;
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct AuthenticatedClient {
+        socket: TestSocket,
+        identity_hash: String,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_ip_clients_have_isolated_authenticated_rate_limits() {
+        let (addr, server_task) = spawn_test_server(test_config(2)).await;
+
+        let mut client_a = connect_authenticated_client(addr).await;
+        let mut client_b = connect_authenticated_client(addr).await;
+
+        send_json(
+            &mut client_a.socket,
+            json!({
+                "type": "ping",
+                "payload": {}
+            }),
+        )
+        .await;
+        let pong = recv_json(&mut client_a.socket).await;
+        assert_eq!(pong["type"], "pong");
+
+        send_json(
+            &mut client_a.socket,
+            json!({
+                "type": "ping",
+                "payload": {}
+            }),
+        )
+        .await;
+        let pong = recv_json(&mut client_a.socket).await;
+        assert_eq!(pong["type"], "pong");
+
+        send_json(
+            &mut client_a.socket,
+            json!({
+                "type": "ping",
+                "payload": {}
+            }),
+        )
+        .await;
+        let rate_limited = recv_json(&mut client_a.socket).await;
+        assert_eq!(rate_limited["type"], "error");
+        assert_eq!(rate_limited["payload"]["code"], "rate_limited");
+
+        send_json(
+            &mut client_b.socket,
+            json!({
+                "type": "ping",
+                "payload": {}
+            }),
+        )
+        .await;
+        let pong = recv_json(&mut client_b.socket).await;
+        assert_eq!(pong["type"], "pong");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_ip_clients_route_messages_to_the_correct_authenticated_identity() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let mut sender = connect_authenticated_client(addr).await;
+        let mut recipient = connect_authenticated_client(addr).await;
+        let message_id = Uuid::new_v4().to_string();
+        let envelope_b64 = STANDARD.encode(b"opaque-envelope");
+
+        send_json(
+            &mut sender.socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": message_id,
+                    "recipient_hash_hex": recipient.identity_hash,
+                    "envelope_b64": envelope_b64
+                }
+            }),
+        )
+        .await;
+
+        let accepted = recv_json(&mut sender.socket).await;
+        assert_eq!(accepted["type"], "msg_accepted");
+        assert_eq!(accepted["payload"]["queued"], true);
+
+        let deliver = recv_json(&mut recipient.socket).await;
+        assert_eq!(deliver["type"], "msg_deliver");
+        assert_eq!(deliver["payload"]["message_id"], message_id);
+        assert_eq!(deliver["payload"]["sender_hash_hex"], sender.identity_hash);
+        assert_eq!(deliver["payload"]["envelope_b64"], envelope_b64);
+
+        server_task.abort();
+    }
+
+    async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let state = Arc::new(RelayState::new(config, None));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server addr");
+        let router = app(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_live_delivery_cleans_up_stale_session_and_keeps_message_queued() {
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<String>();
+        drop(dead_rx);
+
+        state.register_session(
+            "recipient-hash".to_string(),
+            dead_tx,
+            Duration::from_secs(60),
+        );
+
+        let mut authenticated_identity = Some("sender-hash".to_string());
+        let mut rate_limit_key = "sender-hash".to_string();
+        let mut last_pong = Instant::now();
+
+        let should_close = process_frame(
+            &state,
+            &out_tx,
+            &mut authenticated_identity,
+            &mut rate_limit_key,
+            &mut last_pong,
+            ClientFrame {
+                frame_type: "msg_send".to_string(),
+                req_id: Some("req-1".to_string()),
+                payload: serde_json::json!({
+                    "message_id": Uuid::new_v4().to_string(),
+                    "recipient_hash_hex": "recipient-hash",
+                    "envelope_b64": STANDARD.encode(b"opaque-envelope"),
+                }),
+            },
+        )
+        .await;
+
+        assert!(!should_close);
+        assert!(state.sessions.get("recipient-hash").is_none());
+
+        let accepted = out_rx.recv().await.expect("msg_accepted");
+        let accepted: serde_json::Value =
+            serde_json::from_str(&accepted).expect("parse msg_accepted");
+        assert_eq!(accepted["type"], "msg_accepted");
+
+        let queued = state.queue.drain_for_recipient("recipient-hash");
+        assert_eq!(queued.len(), 1);
+    }
+
+    async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
+        let url = format!("ws://{addr}/v1/ws");
+        let (mut socket, _) = connect_async(url).await.expect("connect websocket");
+
+        let mut client_secret_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut client_secret_bytes);
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        let client_pubkey_b64 = STANDARD.encode(client_public.as_bytes());
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64
+                }
+            }),
+        )
+        .await;
+
+        let challenge = recv_json(&mut socket).await;
+        assert_eq!(challenge["type"], "auth_challenge");
+        let payload = &challenge["payload"];
+        let challenge_id = payload["challenge_id"].as_str().expect("challenge_id");
+        let nonce = STANDARD
+            .decode(payload["nonce_b64"].as_str().expect("nonce_b64"))
+            .expect("decode nonce");
+        let server_pubkey_bytes: [u8; 32] = STANDARD
+            .decode(
+                payload["server_pubkey_b64"]
+                    .as_str()
+                    .expect("server_pubkey_b64"),
+            )
+            .expect("decode server pubkey")
+            .try_into()
+            .expect("server pubkey length");
+        let server_public = PublicKey::from(server_pubkey_bytes);
+
+        let shared_secret = client_secret.diffie_hellman(&server_public);
+        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
+        let mut auth_key = [0_u8; 32];
+        let mut info =
+            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
+        info.extend_from_slice(challenge_id.as_bytes());
+        info.extend_from_slice(&nonce);
+        info.extend_from_slice(client_public.as_bytes());
+        hkdf.expand(&info, &mut auth_key).expect("derive auth key");
+
+        let issued_at_ms = payload["issued_at_ms"].as_i64().expect("issued_at_ms");
+        let signed_message = auth::proof_message(challenge_id, issued_at_ms);
+        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
+        mac.update(&signed_message);
+        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_prove",
+                "payload": {
+                    "challenge_id": challenge_id,
+                    "proof_b64": proof_b64
+                }
+            }),
+        )
+        .await;
+
+        let auth_ok = recv_json(&mut socket).await;
+        assert_eq!(auth_ok["type"], "auth_ok");
+        let identity_hash = auth_ok["payload"]["identity_hash_hex"]
+            .as_str()
+            .expect("identity_hash_hex")
+            .to_string();
+
+        let expected_identity_hash = hex::encode(Sha256::digest(client_public.as_bytes()));
+        assert_eq!(identity_hash, expected_identity_hash);
+
+        AuthenticatedClient {
+            socket,
+            identity_hash,
+        }
+    }
+
+    async fn send_json(socket: &mut TestSocket, value: Value) {
+        socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .expect("send websocket text frame");
+    }
+
+    async fn recv_json(socket: &mut TestSocket) -> Value {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .expect("websocket frame")
+                .expect("websocket message");
+
+            match frame {
+                Message::Text(text) => {
+                    let value: Value =
+                        serde_json::from_str(&text).expect("decode websocket json frame");
+                    if value["type"] == "ping" {
+                        send_json(
+                            socket,
+                            json!({
+                                "type": "pong",
+                                "payload": {}
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                    return value;
+                }
+                Message::Ping(payload) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("reply pong");
+                }
+                Message::Pong(_) => {}
+                Message::Close(frame) => panic!("unexpected websocket close: {frame:?}"),
+                other => panic!("unexpected websocket frame: {other:?}"),
+            }
+        }
+    }
+
+    fn test_config(rate_limit_per_min: u32) -> Config {
+        Config {
+            relay_addr: "127.0.0.1:0".to_string(),
+            message_ttl: Duration::from_secs(3600),
+            max_message_bytes: 65_536,
+            max_queue_per_recipient: 500,
+            challenge_ttl: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(3600),
+            rate_limit_per_min,
+            ping_interval: Duration::from_secs(300),
+            pong_timeout: Duration::from_secs(600),
+            apns: ApnsConfig {
+                enabled: false,
+                team_id: None,
+                key_id: None,
+                private_key_path: None,
+                topic: None,
+                environment: ApnsEnvironment::Sandbox,
+            },
+        }
     }
 }
