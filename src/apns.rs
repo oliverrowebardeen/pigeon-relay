@@ -31,14 +31,19 @@ struct CachedJwt {
     issued_at: u64,
 }
 
+struct ApnsSigningKey {
+    key_id: String,
+    key: EncodingKey,
+    jwt_cache: Mutex<Option<CachedJwt>>,
+}
+
 pub struct ApnsClient {
     http_client: reqwest::Client,
     team_id: String,
-    key_id: String,
-    key: EncodingKey,
+    sandbox_signing_key: ApnsSigningKey,
+    production_signing_key: ApnsSigningKey,
     default_topic: String,
     default_environment: ApnsEnvironment,
-    jwt_cache: Mutex<Option<CachedJwt>>,
 }
 
 impl std::fmt::Debug for ApnsClient {
@@ -86,12 +91,27 @@ struct MessagePushAlert {
 
 impl ApnsClient {
     pub fn new(config: &ApnsConfig) -> Result<Self, ApnsError> {
-        let key_path = config
-            .private_key_path
-            .as_deref()
-            .ok_or(ApnsError::MissingField("APNS_PRIVATE_KEY_PATH"))?;
-        let key_data = fs::read(key_path).map_err(ApnsError::KeyRead)?;
-        let key = EncodingKey::from_ec_pem(&key_data).map_err(ApnsError::KeyParse)?;
+        let sandbox_signing_key = load_signing_key(
+            config.sandbox_key_id.as_deref().or(config.key_id.as_deref()),
+            config
+                .sandbox_private_key_path
+                .as_deref()
+                .or(config.private_key_path.as_deref()),
+            "APNS_SANDBOX_KEY_ID/APNS_KEY_ID",
+            "APNS_SANDBOX_PRIVATE_KEY_PATH/APNS_PRIVATE_KEY_PATH",
+        )?;
+        let production_signing_key = load_signing_key(
+            config
+                .production_key_id
+                .as_deref()
+                .or(config.key_id.as_deref()),
+            config
+                .production_private_key_path
+                .as_deref()
+                .or(config.private_key_path.as_deref()),
+            "APNS_PRODUCTION_KEY_ID/APNS_KEY_ID",
+            "APNS_PRODUCTION_PRIVATE_KEY_PATH/APNS_PRIVATE_KEY_PATH",
+        )?;
 
         let http_client = reqwest::Client::builder()
             .build()
@@ -103,22 +123,22 @@ impl ApnsClient {
                 .team_id
                 .clone()
                 .ok_or(ApnsError::MissingField("APNS_TEAM_ID"))?,
-            key_id: config
-                .key_id
-                .clone()
-                .ok_or(ApnsError::MissingField("APNS_KEY_ID"))?,
-            key,
+            sandbox_signing_key,
+            production_signing_key,
             default_topic: config
                 .topic
                 .clone()
                 .ok_or(ApnsError::MissingField("APNS_TOPIC"))?,
             default_environment: config.environment,
-            jwt_cache: Mutex::new(None),
         })
     }
 
     pub async fn send_message_push(&self, request: ApnsSendRequest) -> Result<(), ApnsError> {
-        let jwt = self.get_or_refresh_jwt()?;
+        let signing_key = match request.environment {
+            ApnsEnvironment::Sandbox => &self.sandbox_signing_key,
+            ApnsEnvironment::Production => &self.production_signing_key,
+        };
+        let jwt = self.get_or_refresh_jwt(signing_key)?;
 
         let topic = request
             .topic_override
@@ -158,13 +178,16 @@ impl ApnsClient {
         Err(ApnsError::Rejected { status, body })
     }
 
-    fn get_or_refresh_jwt(&self) -> Result<String, ApnsError> {
+    fn get_or_refresh_jwt(&self, signing_key: &ApnsSigningKey) -> Result<String, ApnsError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let mut cache = self.jwt_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = signing_key
+            .jwt_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         if let Some(cached) = cache.as_ref() {
             if now.saturating_sub(cached.issued_at) < JWT_REFRESH_SECS {
@@ -178,9 +201,9 @@ impl ApnsClient {
         };
 
         let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(self.key_id.clone());
+        header.kid = Some(signing_key.key_id.clone());
 
-        let token = encode(&header, &claims, &self.key).map_err(ApnsError::Jwt)?;
+        let token = encode(&header, &claims, &signing_key.key).map_err(ApnsError::Jwt)?;
 
         *cache = Some(CachedJwt {
             token: token.clone(),
@@ -193,6 +216,25 @@ impl ApnsClient {
     pub fn default_environment(&self) -> ApnsEnvironment {
         self.default_environment
     }
+}
+
+fn load_signing_key(
+    key_id: Option<&str>,
+    private_key_path: Option<&str>,
+    key_id_field: &'static str,
+    private_key_path_field: &'static str,
+) -> Result<ApnsSigningKey, ApnsError> {
+    let key_path = private_key_path.ok_or(ApnsError::MissingField(private_key_path_field))?;
+    let key_data = fs::read(key_path).map_err(ApnsError::KeyRead)?;
+    let key = EncodingKey::from_ec_pem(&key_data).map_err(ApnsError::KeyParse)?;
+
+    Ok(ApnsSigningKey {
+        key_id: key_id
+            .map(ToOwned::to_owned)
+            .ok_or(ApnsError::MissingField(key_id_field))?,
+        key,
+        jwt_cache: Mutex::new(None),
+    })
 }
 
 fn build_message_push_payload() -> MessagePushPayload {
