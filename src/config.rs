@@ -115,13 +115,11 @@ impl Config {
                 "APNS_PRODUCTION_PRIVATE_KEY_PATH",
             )?;
 
-            let has_generic_credentials =
-                apns.key_id.is_some() && apns.private_key_path.is_some();
+            let has_generic_credentials = apns.key_id.is_some() && apns.private_key_path.is_some();
             let has_sandbox_credentials = has_generic_credentials
                 || (apns.sandbox_key_id.is_some() && apns.sandbox_private_key_path.is_some());
             let has_production_credentials = has_generic_credentials
-                || (apns.production_key_id.is_some()
-                    && apns.production_private_key_path.is_some());
+                || (apns.production_key_id.is_some() && apns.production_private_key_path.is_some());
 
             if !has_sandbox_credentials {
                 return Err(ConfigError::MissingApnsField(

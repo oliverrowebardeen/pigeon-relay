@@ -92,7 +92,10 @@ struct MessagePushAlert {
 impl ApnsClient {
     pub fn new(config: &ApnsConfig) -> Result<Self, ApnsError> {
         let sandbox_signing_key = load_signing_key(
-            config.sandbox_key_id.as_deref().or(config.key_id.as_deref()),
+            config
+                .sandbox_key_id
+                .as_deref()
+                .or(config.key_id.as_deref()),
             config
                 .sandbox_private_key_path
                 .as_deref()
