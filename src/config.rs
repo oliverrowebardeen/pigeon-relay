@@ -24,6 +24,10 @@ pub struct ApnsConfig {
     pub team_id: Option<String>,
     pub key_id: Option<String>,
     pub private_key_path: Option<String>,
+    pub sandbox_key_id: Option<String>,
+    pub sandbox_private_key_path: Option<String>,
+    pub production_key_id: Option<String>,
+    pub production_private_key_path: Option<String>,
     pub topic: Option<String>,
     pub environment: ApnsEnvironment,
 }
@@ -77,6 +81,10 @@ impl Config {
             team_id: env::var("APNS_TEAM_ID").ok(),
             key_id: env::var("APNS_KEY_ID").ok(),
             private_key_path: env::var("APNS_PRIVATE_KEY_PATH").ok(),
+            sandbox_key_id: env::var("APNS_SANDBOX_KEY_ID").ok(),
+            sandbox_private_key_path: env::var("APNS_SANDBOX_PRIVATE_KEY_PATH").ok(),
+            production_key_id: env::var("APNS_PRODUCTION_KEY_ID").ok(),
+            production_private_key_path: env::var("APNS_PRODUCTION_PRIVATE_KEY_PATH").ok(),
             topic: env::var("APNS_TOPIC").ok(),
             environment: apns_environment,
         };
@@ -85,14 +93,45 @@ impl Config {
             if apns.team_id.is_none() {
                 return Err(ConfigError::MissingApnsField("APNS_TEAM_ID"));
             }
-            if apns.key_id.is_none() {
-                return Err(ConfigError::MissingApnsField("APNS_KEY_ID"));
-            }
-            if apns.private_key_path.is_none() {
-                return Err(ConfigError::MissingApnsField("APNS_PRIVATE_KEY_PATH"));
-            }
             if apns.topic.is_none() {
                 return Err(ConfigError::MissingApnsField("APNS_TOPIC"));
+            }
+            validate_apns_credential_pair(
+                apns.key_id.as_deref(),
+                apns.private_key_path.as_deref(),
+                "APNS_KEY_ID",
+                "APNS_PRIVATE_KEY_PATH",
+            )?;
+            validate_apns_credential_pair(
+                apns.sandbox_key_id.as_deref(),
+                apns.sandbox_private_key_path.as_deref(),
+                "APNS_SANDBOX_KEY_ID",
+                "APNS_SANDBOX_PRIVATE_KEY_PATH",
+            )?;
+            validate_apns_credential_pair(
+                apns.production_key_id.as_deref(),
+                apns.production_private_key_path.as_deref(),
+                "APNS_PRODUCTION_KEY_ID",
+                "APNS_PRODUCTION_PRIVATE_KEY_PATH",
+            )?;
+
+            let has_generic_credentials =
+                apns.key_id.is_some() && apns.private_key_path.is_some();
+            let has_sandbox_credentials = has_generic_credentials
+                || (apns.sandbox_key_id.is_some() && apns.sandbox_private_key_path.is_some());
+            let has_production_credentials = has_generic_credentials
+                || (apns.production_key_id.is_some()
+                    && apns.production_private_key_path.is_some());
+
+            if !has_sandbox_credentials {
+                return Err(ConfigError::MissingApnsField(
+                    "APNS_SANDBOX_KEY_ID or APNS_KEY_ID",
+                ));
+            }
+            if !has_production_credentials {
+                return Err(ConfigError::MissingApnsField(
+                    "APNS_PRODUCTION_KEY_ID or APNS_KEY_ID",
+                ));
             }
         }
 
@@ -136,4 +175,17 @@ fn parse_bool(name: &'static str, default: bool) -> bool {
 
 fn parse_apns_environment(value: Option<String>) -> ApnsEnvironment {
     value.and_then(|v| v.parse().ok()).unwrap_or_default()
+}
+
+fn validate_apns_credential_pair(
+    key_id: Option<&str>,
+    private_key_path: Option<&str>,
+    key_id_field: &'static str,
+    private_key_path_field: &'static str,
+) -> Result<(), ConfigError> {
+    match (key_id, private_key_path) {
+        (Some(_), None) => Err(ConfigError::MissingApnsField(private_key_path_field)),
+        (None, Some(_)) => Err(ConfigError::MissingApnsField(key_id_field)),
+        _ => Ok(()),
+    }
 }
