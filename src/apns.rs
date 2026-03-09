@@ -242,8 +242,8 @@ fn build_message_push_payload() -> MessagePushPayload {
         aps: MessagePushApsPayload {
             content_available: 1,
             alert: MessagePushAlert {
-                title: "New Pigeon message",
-                body: "Open Pigeon to sync new messages.",
+                title: "New message",
+                body: "You have new messages in Pigeon.",
             },
             sound: "default",
         },
@@ -268,8 +268,8 @@ mod tests {
                 "aps": {
                     "content-available": 1,
                     "alert": {
-                        "title": "New Pigeon message",
-                        "body": "Open Pigeon to sync new messages."
+                        "title": "New message",
+                        "body": "You have new messages in Pigeon."
                     },
                     "sound": "default"
                 },
