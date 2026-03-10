@@ -192,10 +192,10 @@ impl ApnsClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        if let Some(cached) = cache.as_ref() {
-            if now.saturating_sub(cached.issued_at) < JWT_REFRESH_SECS {
-                return Ok(cached.token.clone());
-            }
+        if let Some(cached) = cache.as_ref()
+            && now.saturating_sub(cached.issued_at) < JWT_REFRESH_SECS
+        {
+            return Ok(cached.token.clone());
         }
 
         let claims = JwtClaims {
