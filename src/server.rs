@@ -905,7 +905,7 @@ mod tests {
 
     async fn send_json(socket: &mut TestSocket, value: Value) {
         socket
-            .send(Message::Text(value.to_string().into()))
+            .send(Message::Text(value.to_string()))
             .await
             .expect("send websocket text frame");
     }
