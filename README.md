@@ -215,6 +215,34 @@ CI runs on every push and pull request:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 
+## Deployment
+
+The relay runs as a systemd service. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
+
+**Server layout:**
+
+```
+/opt/pigeon-relay/          # git clone of this repo
+/etc/pigeon-relay/
+  pigeon-relay.env          # environment variables (secrets, config)
+  AuthKey_*.p8              # APNS signing keys (chmod 600)
+```
+
+**Update from a new push:**
+
+```bash
+cd /opt/pigeon-relay
+git pull origin main
+source "$HOME/.cargo/env"
+cargo build --release
+systemctl restart pigeon-relay
+systemctl status pigeon-relay   # verify it started
+```
+
+The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to load secrets at startup. The `.env` file in the repo directory is for local development only and is never committed.
+
+**Note:** Restarting the service drops all active WebSocket connections and clears the in-memory message queue. Connected clients will reconnect automatically.
+
 ## Related
 
 <!-- TODO(oliver): Update this URL when the iOS repo is published -->
