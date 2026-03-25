@@ -4,6 +4,8 @@ An opaque, zero-knowledge WebSocket relay server for [Pigeon](https://github.com
 
 The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
 
+**Try Pigeon:** The iOS app is available on [TestFlight](https://testflight.apple.com/join/nv3UA1Hy) for the first 100 testers.
+
 ## Architecture
 
 ```
