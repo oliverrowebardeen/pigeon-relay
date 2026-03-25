@@ -1,54 +1,121 @@
 # pigeon-relay
 
-Minimal authenticated websocket relay for Pigeon encrypted message envelopes.
+An opaque, zero-knowledge WebSocket relay server for [Pigeon](https://github.com/oliverrowebardeen/pigeon-ios) -- an end-to-end encrypted messenger that communicates over BLE mesh, internet relay, or both.
 
-## Features
+The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
 
-- Auth challenge-response using existing Curve25519 keypairs (no accounts)
-- Encrypted blob queue keyed by recipient public-key hash
-- Delivery ack routing (`msg_ack` -> `msg_acked`)
-- In-memory queue with TTL and dedup
-- Optional APNS silent background pushes for offline recipients
+## Architecture
+
+```
+                         Internet
+                            |
+          +-----------------+-----------------+
+          |                                   |
+     Phone A                             Phone B
+     (sender)                           (recipient)
+          |                                   |
+          |   1. auth_hello / auth_prove      |
+          +----------> [ Relay ] <------------+
+          |         (opaque box)              |
+          |                                   |
+          |   2. msg_send(envelope_b64)       |
+          +----------> [ Queue ] ------------>+
+          |         never decrypted       msg_deliver
+          |                                   |
+          |   3. msg_ack                      |
+          +<----------- msg_acked <-----------+
+          |                                   |
+          |   If offline:                     |
+          |   APNS silent push -------> wake  |
+          |                                   |
+     +----+----+                              |
+     | BLE mesh |  (direct, no relay)         |
+     +----+----+                              |
+          |                                   |
+          +------- BLE multi-hop ------------>+
+
+     Bridge Mode:
+     Phone C (BLE-only) --> BLE --> Phone B (bridge) --> WS --> Relay --> Phone A
+```
+
+Every message between clients is encrypted end-to-end with AES-256-GCM before it reaches the relay. The relay sees only opaque base64 blobs and identity hashes -- never plaintext, never sender names, never message content.
+
+## Key Design Decisions
+
+**Zero-knowledge relay.** The server cannot read messages. The `envelope_b64` field is an opaque encrypted blob. Sender-recipient correlation uses SHA-256 hashes of public keys, not human-readable identifiers.
+
+**Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
+
+**Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+
+**Bridge-transparent.** A bridge phone that relays traffic for nearby BLE-only peers doesn't need special server-side logic. Each tunneled peer authenticates as itself over its own WebSocket session. Multiple identities behind the same NAT/IP are expected and rate-limited independently.
+
+## Authentication Flow
+
+```
+Client                          Relay
+  |                               |
+  |  auth_hello(client_pubkey)    |
+  +------------------------------>|
+  |                               |  generate ephemeral X25519 keypair
+  |                               |  generate nonce
+  |  auth_challenge(server_pub,   |
+  |    nonce, challenge_id)       |
+  |<------------------------------+
+  |                               |
+  |  ECDH shared secret           |
+  |  HKDF-SHA256 derive auth_key  |
+  |  HMAC(challenge_id || iat)    |
+  |                               |
+  |  auth_prove(challenge_id,     |
+  |    proof)                     |
+  +------------------------------>|  verify HMAC (constant-time)
+  |                               |  identity = SHA-256(client_pubkey)
+  |  auth_ok(identity_hash,       |
+  |    session_expires_at)        |
+  |<------------------------------+
+  |                               |  deliver any queued messages
+```
 
 ## Protocol
 
-Websocket endpoint: `/v1/ws`
+WebSocket endpoint: `/v1/ws`
 
-Frame types:
+All frames are JSON with a `type` field:
 
-- `auth_hello`
-- `auth_challenge`
-- `auth_prove`
-- `auth_ok`
-- `msg_send`
-- `msg_accepted`
-- `msg_deliver`
-- `msg_ack`
-- `msg_acked`
-- `push_register`
-- `error`
-- `ping` / `pong`
+| Frame | Direction | Description |
+|-------|-----------|-------------|
+| `auth_hello` | client -> server | Start authentication with client public key |
+| `auth_challenge` | server -> client | Ephemeral server key, nonce, challenge ID |
+| `auth_prove` | client -> server | HMAC proof of shared secret |
+| `auth_ok` | server -> client | Authentication succeeded, identity hash assigned |
+| `msg_send` | client -> server | Send encrypted envelope to recipient hash |
+| `msg_accepted` | server -> client | Envelope queued, with queue depth |
+| `msg_deliver` | server -> client | Deliver envelope to recipient |
+| `msg_ack` | client -> server | Acknowledge receipt of message |
+| `msg_acked` | server -> client | Notify sender their message was acknowledged |
+| `push_register` | client -> server | Register APNS device token |
+| `ping` / `pong` | bidirectional | Keepalive |
+| `error` | server -> client | Error with code and message |
 
-## Bridge / NAT Behavior
+## Building from Source
 
-`pigeon-relay` does not need a separate server-side bridge mode.
-
-- A bridge phone keeps its own normal `/v1/ws` session.
-- Each BLE-only peer tunneled through that bridge opens its own normal `/v1/ws` session and authenticates as itself.
-- The relay still tracks one active session per identity, not "bridge acting on behalf of peers".
-- Several identities can safely connect from the same public IP / NAT. That is the expected production shape when one bridge device carries relay traffic for nearby peers.
-
-Rate limiting is intentionally scoped this way:
-
-- Before auth: per websocket connection (`anon:<connection-id>`)
-- After auth: per authenticated identity hash
-
-That prevents one bridged peer from consuming the authenticated budget for every other peer behind the same bridge.
-
-## Local Run
+**Prerequisites:**
+- Rust 1.85+ (this project uses edition 2024)
+- Git
 
 ```bash
+git clone https://github.com/oliverrowebardeen/pigeon-relay.git
+cd pigeon-relay
+cargo build --release
+```
+
+## Running
+
+```bash
+# Optional: configure via environment variables (see below)
 source .env 2>/dev/null || true
+
 cargo run --release
 ```
 
@@ -60,43 +127,99 @@ Health check:
 curl http://127.0.0.1:8080/healthz
 ```
 
-## Environment Variables
+## Configuration
 
-- `RELAY_ADDR` (default `0.0.0.0:8080`)
-- `RELAY_MESSAGE_TTL` (default `168h`)
-- `RELAY_MAX_MESSAGE_BYTES` (default `65536`)
-- `RELAY_MAX_QUEUE_PER_RECIPIENT` (default `500`)
-- `RELAY_CHALLENGE_TTL` (default `30s`)
-- `RELAY_SESSION_TTL` (default `24h`)
-- `RELAY_RATE_LIMIT_PER_MIN` (default `60`)
-- `RELAY_PING_INTERVAL` (default `25s`)
-- `RELAY_PONG_TIMEOUT` (default `60s`)
-- `APNS_ENABLED` (`true`/`false`, default `false`)
-- `APNS_TEAM_ID`
-- `APNS_KEY_ID`
-- `APNS_PRIVATE_KEY_PATH`
-- `APNS_TOPIC`
-- `APNS_ENV` (`sandbox` or `production`, default `sandbox`)
-  - Use `production` for TestFlight and App Store builds.
-  - Use `sandbox` for debug builds installed directly from Xcode on a device.
+All configuration is via environment variables with sensible defaults:
 
-## APNS Notes
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_ADDR` | `0.0.0.0:8080` | Listen address |
+| `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |
+| `RELAY_MAX_MESSAGE_BYTES` | `65536` | Maximum envelope size |
+| `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap |
+| `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
+| `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
+| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |
+| `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
+| `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
 
-When `APNS_ENABLED=true`, all APNS fields are required.
+### APNS Configuration
 
-The relay now sends a silent background push for offline recipients:
+When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offline recipients:
+
+| Variable | Description |
+|----------|-------------|
+| `APNS_ENABLED` | `true` / `false` (default `false`) |
+| `APNS_TEAM_ID` | Apple Developer Team ID |
+| `APNS_KEY_ID` | Default APNS key ID (fallback for both environments) |
+| `APNS_PRIVATE_KEY_PATH` | Default path to `.p8` key file |
+| `APNS_SANDBOX_KEY_ID` | Sandbox-specific key ID (overrides default) |
+| `APNS_SANDBOX_PRIVATE_KEY_PATH` | Sandbox-specific key path |
+| `APNS_PRODUCTION_KEY_ID` | Production-specific key ID (overrides default) |
+| `APNS_PRODUCTION_PRIVATE_KEY_PATH` | Production-specific key path |
+| `APNS_TOPIC` | App bundle ID |
+| `APNS_ENV` | `sandbox` or `production` (default `sandbox`) |
+
+Use `production` for TestFlight and App Store builds. Use `sandbox` for debug builds installed from Xcode.
+
+The push payload is a silent background notification:
 
 ```json
 {
-  "aps": {
-    "content-available": 1
-  },
+  "aps": { "content-available": 1 },
   "pigeon_type": "relay_message"
 }
 ```
 
-The relay no longer sends a user-visible APNS alert. Recipients only get a background wake signal when iOS chooses to deliver it.
+## Rate Limiting
+
+Rate limiting is scoped to prevent abuse while supporting bridge mode:
+
+- **Before authentication:** per WebSocket connection (`anon:<connection-id>`)
+- **After authentication:** per identity hash
+
+This means multiple BLE-only peers tunneled through a single bridge phone each get their own rate limit budget, rather than sharing one.
+
+## Bridge / NAT Behavior
+
+`pigeon-relay` does not need a separate server-side bridge mode.
+
+- A bridge phone keeps its own normal `/v1/ws` session.
+- Each BLE-only peer tunneled through that bridge opens its own `/v1/ws` session and authenticates as itself.
+- The relay tracks one active session per identity, not "bridge acting on behalf of peers".
+- Multiple identities from the same public IP / NAT is the expected production shape when a bridge device carries relay traffic for nearby peers.
+
+## Message Queue
+
+Messages are stored in an in-memory queue keyed by recipient identity hash:
+
+- **TTL:** configurable per message (default 7 days)
+- **Deduplication:** same message ID to same recipient is only queued once
+- **Per-recipient cap:** oldest messages are dropped when the cap is exceeded
+- **Drain on connect:** queued messages are delivered immediately when a recipient authenticates
+
+The queue is not persisted to disk. A server restart clears all queued messages.
+
+## Testing
+
+```bash
+cargo test --all-targets --all-features
+```
+
+Tests include integration tests that stand up a real WebSocket server and perform full ECDH authentication handshakes.
+
+## CI
+
+CI runs on every push and pull request:
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+## Related
+
+<!-- TODO(oliver): Update this URL when the iOS repo is published -->
+- [Pigeon iOS app](https://github.com/oliverrowebardeen/pigeon-ios) -- the end-to-end encrypted messenger client
 
 ## License
 
-MIT
+[MIT](LICENSE)
