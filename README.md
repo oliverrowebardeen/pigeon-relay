@@ -245,7 +245,6 @@ The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to lo
 
 ## Related
 
-<!-- TODO(oliver): Update this URL when the iOS repo is published -->
 - [Pigeon iOS app](https://github.com/oliverrowebardeen/pigeon-ios) -- the end-to-end encrypted messenger client
 
 ## License
