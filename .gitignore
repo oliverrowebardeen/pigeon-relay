@@ -4,3 +4,7 @@
 *.p8
 *.pem
 *.key
+AGENTS.md
+CLAUDE.md
+CODEX.md
+CONTEXT.md
