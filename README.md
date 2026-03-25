@@ -8,7 +8,7 @@ Minimal authenticated websocket relay for Pigeon encrypted message envelopes.
 - Encrypted blob queue keyed by recipient public-key hash
 - Delivery ack routing (`msg_ack` -> `msg_acked`)
 - In-memory queue with TTL and dedup
-- Optional APNS generic alert pushes for offline recipients
+- Optional APNS silent background pushes for offline recipients
 
 ## Protocol
 
@@ -84,27 +84,18 @@ curl http://127.0.0.1:8080/healthz
 
 When `APNS_ENABLED=true`, all APNS fields are required.
 
-The relay now sends a generic user-visible notification for offline recipients:
+The relay now sends a silent background push for offline recipients:
 
 ```json
 {
   "aps": {
-    "content-available": 1,
-    "alert": {
-      "title": "New Pigeon message",
-      "body": "Open Pigeon to sync new messages."
-    },
-    "sound": "default"
+    "content-available": 1
   },
   "pigeon_type": "relay_message"
 }
 ```
 
-This is intentional:
-
-- Silent-only pushes do not wake an iPhone after the user force-quits the app.
-- A visible APNS alert still lets the user know a message arrived and can relaunch Pigeon by tapping it.
-- The relay cannot include sender names or message previews in the APNS payload because message contents stay end-to-end encrypted.
+The relay no longer sends a user-visible APNS alert. Recipients only get a background wake signal when iOS chooses to deliver it.
 
 ## License
 
