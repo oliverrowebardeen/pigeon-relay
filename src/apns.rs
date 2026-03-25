@@ -79,14 +79,6 @@ struct MessagePushPayload {
 struct MessagePushApsPayload {
     #[serde(rename = "content-available")]
     content_available: u8,
-    alert: MessagePushAlert,
-    sound: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct MessagePushAlert {
-    title: &'static str,
-    body: &'static str,
 }
 
 impl ApnsClient {
@@ -161,8 +153,8 @@ impl ApnsClient {
             .post(url)
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", topic)
-            .header("apns-push-type", "alert")
-            .header("apns-priority", "10")
+            .header("apns-push-type", "background")
+            .header("apns-priority", "5")
             .json(&payload)
             .send()
             .await
@@ -244,11 +236,6 @@ fn build_message_push_payload() -> MessagePushPayload {
     MessagePushPayload {
         aps: MessagePushApsPayload {
             content_available: 1,
-            alert: MessagePushAlert {
-                title: "New message",
-                body: "You have new messages in Pigeon.",
-            },
-            sound: "default",
         },
         pigeon_type: "relay_message",
     }
@@ -261,7 +248,7 @@ mod tests {
     use super::build_message_push_payload;
 
     #[test]
-    fn serializes_message_push_payload_for_force_quit_delivery() {
+    fn serializes_message_push_payload_as_silent_background_push() {
         let payload =
             serde_json::to_value(build_message_push_payload()).expect("serialize APNS payload");
 
@@ -269,12 +256,7 @@ mod tests {
             payload,
             json!({
                 "aps": {
-                    "content-available": 1,
-                    "alert": {
-                        "title": "New message",
-                        "body": "You have new messages in Pigeon."
-                    },
-                    "sound": "default"
+                    "content-available": 1
                 },
                 "pigeon_type": "relay_message"
             })
