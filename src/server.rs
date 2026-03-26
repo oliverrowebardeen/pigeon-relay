@@ -44,7 +44,7 @@ fn app(state: Arc<RelayState>) -> Router {
 }
 
 async fn healthz() -> &'static str {
-    "ok"
+    "ok\n"
 }
 
 async fn ws_handler(
