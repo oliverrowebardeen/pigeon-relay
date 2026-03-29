@@ -30,5 +30,4 @@ uuid = { version = "1", features = ["serde", "v4"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
-serde_json = "1"
 tokio-tungstenite = "0.24"

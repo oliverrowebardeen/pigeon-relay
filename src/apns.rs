@@ -1,5 +1,6 @@
 use std::fs;
-use std::sync::Mutex;
+
+use tokio::sync::Mutex;
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::StatusCode;
@@ -133,7 +134,7 @@ impl ApnsClient {
             ApnsEnvironment::Sandbox => &self.sandbox_signing_key,
             ApnsEnvironment::Production => &self.production_signing_key,
         };
-        let jwt = self.get_or_refresh_jwt(signing_key)?;
+        let jwt = self.get_or_refresh_jwt(signing_key).await?;
 
         let topic = request
             .topic_override
@@ -173,16 +174,13 @@ impl ApnsClient {
         Err(ApnsError::Rejected { status, body })
     }
 
-    fn get_or_refresh_jwt(&self, signing_key: &ApnsSigningKey) -> Result<String, ApnsError> {
+    async fn get_or_refresh_jwt(&self, signing_key: &ApnsSigningKey) -> Result<String, ApnsError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let mut cache = signing_key
-            .jwt_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = signing_key.jwt_cache.lock().await;
 
         if let Some(cached) = cache.as_ref()
             && now.saturating_sub(cached.issued_at) < JWT_REFRESH_SECS
