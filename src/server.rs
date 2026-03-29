@@ -10,10 +10,14 @@ use chrono::{Duration as ChronoDuration, Utc};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::apns::ApnsSendRequest;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use reqwest::StatusCode;
+
+use crate::apns::{ApnsError, ApnsSendRequest};
 use crate::auth;
 use crate::config::ApnsEnvironment;
 use crate::protocol::{
@@ -25,6 +29,7 @@ use crate::state::{PushRegistration, RelayState};
 
 pub async fn run_server(
     state: Arc<RelayState>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = app(state.clone());
 
@@ -32,7 +37,9 @@ pub async fn run_server(
 
     let listener = TcpListener::bind(&state.config.relay_addr).await?;
     info!(addr = %state.config.relay_addr, "relay server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -51,7 +58,9 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(state, socket))
+    let max_size = state.config.max_message_bytes + 4096; // headroom for JSON framing
+    ws.max_message_size(max_size)
+        .on_upgrade(move |socket| handle_socket(state, socket))
 }
 
 async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
@@ -107,7 +116,9 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                             continue;
                         };
 
-                        if !state.allow_request(&rate_limit_key) {
+                        if frame.frame_type != "pong"
+                            && !state.allow_request(&rate_limit_key)
+                        {
                             let _ = send_error(
                                 &out_tx,
                                 frame.req_id.clone(),
@@ -150,7 +161,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     }
 
     drop(out_tx);
-    writer.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
 }
 
 async fn process_frame(
@@ -163,6 +174,16 @@ async fn process_frame(
 ) -> bool {
     match frame.frame_type.as_str() {
         "auth_hello" => {
+            if state.challenges.len() >= state.config.max_concurrent_challenges {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "server_busy",
+                    "too many pending challenges",
+                );
+                return false;
+            }
+
             if authenticated_identity.is_some() {
                 let _ = send_error(
                     out_tx,
@@ -320,6 +341,16 @@ async fn process_frame(
                 }
             };
 
+            if !is_valid_identity_hash(&payload.recipient_hash_hex) {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "bad_payload",
+                    "recipient_hash_hex must be a 64-character hex string",
+                );
+                return false;
+            }
+
             let message_id = match Uuid::parse_str(&payload.message_id) {
                 Ok(id) => id,
                 Err(_) => {
@@ -328,26 +359,20 @@ async fn process_frame(
                 }
             };
 
-            let b64_len = payload.envelope_b64.len();
-            if b64_len < 4 || b64_len % 4 != 0 {
-                let _ = send_error(
-                    out_tx,
-                    frame.req_id,
-                    "bad_payload",
-                    "envelope_b64 must be valid base64",
-                );
-                return false;
-            }
-            let padding = payload
-                .envelope_b64
-                .as_bytes()
-                .iter()
-                .rev()
-                .take_while(|&&b| b == b'=')
-                .count();
-            let decoded_len = (b64_len / 4) * 3 - padding;
+            let envelope_bytes = match STANDARD.decode(&payload.envelope_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let _ = send_error(
+                        out_tx,
+                        frame.req_id,
+                        "bad_payload",
+                        "invalid base64 envelope",
+                    );
+                    return false;
+                }
+            };
 
-            if decoded_len > state.config.max_message_bytes {
+            if envelope_bytes.len() > state.config.max_message_bytes {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -384,8 +409,14 @@ async fn process_frame(
                     None,
                     deliver_payload,
                 )
-                .is_err()
+                .is_ok()
                 {
+                    // Dequeue to prevent double delivery if recipient reconnects and drains
+                    drop(recipient_session);
+                    state
+                        .queue
+                        .ack_message(&payload.recipient_hash_hex, message_id);
+                } else {
                     drop(recipient_session);
                     state.unregister_session(&payload.recipient_hash_hex);
                     warn!(
@@ -459,6 +490,16 @@ async fn process_frame(
             false
         }
         "push_register" => {
+            if state.push_tokens.len() >= state.config.max_push_registrations {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "server_busy",
+                    "push registration limit reached",
+                );
+                return false;
+            }
+
             let Some(identity_hash) = authenticated_identity.as_ref() else {
                 let _ = send_error(
                     out_tx,
@@ -524,6 +565,7 @@ async fn process_frame(
                         (!trimmed.is_empty()).then(|| trimmed.to_string())
                     }),
                     last_push_at: None,
+                    registered_at: Instant::now(),
                 },
             );
             info!(
@@ -533,6 +575,7 @@ async fn process_frame(
                 "registered APNS push token"
             );
 
+            let _ = send_frame(out_tx, "push_registered", frame.req_id, EmptyPayload {});
             false
         }
         "pong" => {
@@ -575,6 +618,7 @@ async fn maybe_trigger_apns(state: &Arc<RelayState>, recipient_hash: &str) {
 
     let apns_client = apns_client.clone();
     let recipient_hash = recipient_hash.to_string();
+    let state = state.clone();
     tokio::spawn(async move {
         info!(
             recipient = %hash_prefix(&recipient_hash),
@@ -582,8 +626,18 @@ async fn maybe_trigger_apns(state: &Arc<RelayState>, recipient_hash: &str) {
             has_topic_override = request.topic_override.is_some(),
             "sending APNS push"
         );
-        if let Err(error) = apns_client.send_message_push(request).await {
-            warn!(?error, "failed to send APNS message push");
+        match apns_client.send_message_push(request).await {
+            Ok(()) => {}
+            Err(ApnsError::Rejected { status, .. }) if status == StatusCode::GONE => {
+                state.push_tokens.remove(&recipient_hash);
+                warn!(
+                    recipient = %hash_prefix(&recipient_hash),
+                    "removed expired APNS token (410 Gone)"
+                );
+            }
+            Err(error) => {
+                warn!(?error, "failed to send APNS message push");
+            }
         }
     });
 }
@@ -629,12 +683,17 @@ async fn purge_loop(state: Arc<RelayState>) {
     loop {
         interval.tick().await;
         state.purge_expired();
-        info!(
+        debug!(
             sessions = state.sessions.len(),
             challenges = state.challenges.len(),
+            push_tokens = state.push_tokens.len(),
             "purged expired state"
         );
     }
+}
+
+fn is_valid_identity_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -775,19 +834,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_live_delivery_cleans_up_stale_session_and_keeps_message_queued() {
+        let recipient_hash = "b".repeat(64);
+        let sender_hash = "a".repeat(64);
+
         let state = Arc::new(RelayState::new(test_config(10), None));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let (dead_tx, dead_rx) = mpsc::unbounded_channel::<String>();
         drop(dead_rx);
 
-        state.register_session(
-            "recipient-hash".to_string(),
-            dead_tx,
-            Duration::from_secs(60),
-        );
+        state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
 
-        let mut authenticated_identity = Some("sender-hash".to_string());
-        let mut rate_limit_key = "sender-hash".to_string();
+        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
 
         let should_close = process_frame(
@@ -801,7 +859,7 @@ mod tests {
                 req_id: Some("req-1".to_string()),
                 payload: serde_json::json!({
                     "message_id": Uuid::new_v4().to_string(),
-                    "recipient_hash_hex": "recipient-hash",
+                    "recipient_hash_hex": recipient_hash,
                     "envelope_b64": STANDARD.encode(b"opaque-envelope"),
                 }),
             },
@@ -809,14 +867,14 @@ mod tests {
         .await;
 
         assert!(!should_close);
-        assert!(state.sessions.get("recipient-hash").is_none());
+        assert!(state.sessions.get(&"b".repeat(64)).is_none());
 
         let accepted = out_rx.recv().await.expect("msg_accepted");
         let accepted: serde_json::Value =
             serde_json::from_str(&accepted).expect("parse msg_accepted");
         assert_eq!(accepted["type"], "msg_accepted");
 
-        let queued = state.queue.drain_for_recipient("recipient-hash");
+        let queued = state.queue.drain_for_recipient(&"b".repeat(64));
         assert_eq!(queued.len(), 1);
     }
 
@@ -959,6 +1017,9 @@ mod tests {
             rate_limit_per_min,
             ping_interval: Duration::from_secs(300),
             pong_timeout: Duration::from_secs(600),
+            max_concurrent_challenges: 10_000,
+            max_push_registrations: 10_000,
+            push_token_ttl: Duration::from_secs(3600),
             apns: ApnsConfig {
                 enabled: false,
                 team_id: None,
