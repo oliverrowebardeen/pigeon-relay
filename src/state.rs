@@ -24,6 +24,7 @@ pub struct PushRegistration {
     pub apns_env: ApnsEnvironment,
     pub topic_override: Option<String>,
     pub last_push_at: Option<Instant>,
+    pub registered_at: Instant,
 }
 
 #[derive(Debug)]
@@ -89,6 +90,13 @@ impl RelayState {
         sender: mpsc::UnboundedSender<String>,
         session_ttl: Duration,
     ) {
+        // Notify old session before replacing it (I2: session hijacking prevention)
+        if let Some((_, old_handle)) = self.sessions.remove(&identity_hash) {
+            let _ = old_handle
+                .sender
+                .send(r#"{"type":"session_replaced","payload":{}}"#.to_string());
+        }
+
         let now = Instant::now();
         let handle = SessionHandle {
             sender,
@@ -145,6 +153,8 @@ impl RelayState {
             .retain(|_, window| now.duration_since(window.started_at) <= Duration::from_secs(300));
         self.pending_acks
             .retain(|_, (stored_at, _)| now.duration_since(*stored_at) <= self.config.session_ttl);
+        self.push_tokens
+            .retain(|_, reg| now.duration_since(reg.registered_at) <= self.config.push_token_ttl);
 
         self.queue.purge_expired();
     }

@@ -15,6 +15,9 @@ pub struct Config {
     pub rate_limit_per_min: u32,
     pub ping_interval: Duration,
     pub pong_timeout: Duration,
+    pub max_concurrent_challenges: usize,
+    pub max_push_registrations: usize,
+    pub push_token_ttl: Duration,
     pub apns: ApnsConfig,
 }
 
@@ -72,6 +75,9 @@ impl Config {
         let rate_limit_per_min = parse_num("RELAY_RATE_LIMIT_PER_MIN", "60")?;
         let ping_interval = parse_duration("RELAY_PING_INTERVAL", "25s")?;
         let pong_timeout = parse_duration("RELAY_PONG_TIMEOUT", "60s")?;
+        let max_concurrent_challenges = parse_num("RELAY_MAX_CHALLENGES", "10000")?;
+        let max_push_registrations = parse_num("RELAY_MAX_PUSH_REGISTRATIONS", "100000")?;
+        let push_token_ttl = parse_duration("RELAY_PUSH_TOKEN_TTL", "720h")?;
 
         let apns_enabled = parse_bool("APNS_ENABLED", false);
         let apns_environment = parse_apns_environment(env::var("APNS_ENV").ok());
@@ -143,6 +149,9 @@ impl Config {
             rate_limit_per_min,
             ping_interval,
             pong_timeout,
+            max_concurrent_challenges,
+            max_push_registrations,
+            push_token_ttl,
             apns,
         })
     }

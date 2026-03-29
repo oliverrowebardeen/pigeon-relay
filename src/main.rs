@@ -50,19 +50,13 @@ async fn main() {
         "starting pigeon-relay"
     );
 
-    tokio::select! {
-        result = server::run_server(state.clone()) => {
-            if let Err(error) = result {
-                error!(?error, "relay server stopped with error");
-                std::process::exit(1);
-            }
-        }
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(error) = signal {
-                error!(?error, "failed waiting for ctrl-c signal");
-                std::process::exit(1);
-            }
-            info!("received ctrl-c; shutting down");
-        }
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        info!("received ctrl-c; shutting down gracefully");
+    };
+
+    if let Err(error) = server::run_server(state, shutdown).await {
+        error!(?error, "relay server stopped with error");
+        std::process::exit(1);
     }
 }
