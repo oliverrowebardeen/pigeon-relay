@@ -751,6 +751,51 @@ mod tests {
         server_task.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_sender_deliver_payload_contains_no_sender_identity() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let mut sender = connect_authenticated_client(addr).await;
+        let mut recipient = connect_authenticated_client(addr).await;
+        let message_id = Uuid::new_v4().to_string();
+        let envelope_b64 = STANDARD.encode(b"opaque-envelope");
+
+        send_json(
+            &mut sender.socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": message_id,
+                    "recipient_hash_hex": recipient.identity_hash,
+                    "envelope_b64": envelope_b64
+                }
+            }),
+        )
+        .await;
+
+        let _accepted = recv_json(&mut sender.socket).await;
+        let deliver = recv_json(&mut recipient.socket).await;
+        assert_eq!(deliver["type"], "msg_deliver");
+        assert_eq!(deliver["payload"]["message_id"], message_id);
+        assert_eq!(deliver["payload"]["envelope_b64"], envelope_b64);
+
+        // Sealed sender: no sender identity in delivery payload
+        assert!(deliver["payload"].get("sender_hash_hex").is_none());
+
+        // Only expected fields present
+        let payload_obj = deliver["payload"].as_object().unwrap();
+        let keys: std::collections::HashSet<&str> =
+            payload_obj.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["message_id", "envelope_b64", "queued_at_ms"]
+                .into_iter()
+                .collect()
+        );
+
+        server_task.abort();
+    }
+
     async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let state = Arc::new(RelayState::new(config, None));
         let listener = TcpListener::bind("127.0.0.1:0")
