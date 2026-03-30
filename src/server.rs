@@ -25,7 +25,7 @@ use crate::protocol::{
     MessageAcceptedPayload, MessageDeliverPayload, MessageSendPayload, PushRegisterPayload,
     frame_json, parse_payload,
 };
-use crate::state::{PushRegistration, RelayState};
+use crate::state::{OutboundFrame, PushRegistration, RelayState};
 
 pub async fn run_server(
     state: Arc<RelayState>,
@@ -66,15 +66,19 @@ async fn ws_handler(
 async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     let connection_id = Uuid::new_v4().to_string();
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(state.config.max_session_send_queue);
 
     let writer = tokio::spawn(async move {
-        while let Some(serialized) = out_rx.recv().await {
-            if ws_sender
-                .send(Message::Text(serialized.into()))
+        while let Some(outbound) = out_rx.recv().await {
+            let send_result = ws_sender
+                .send(Message::Text(outbound.serialized.into()))
                 .await
-                .is_err()
-            {
+                .map_err(|_| ());
+            let send_failed = send_result.is_err();
+            if let Some(delivery_tx) = outbound.delivery_tx {
+                let _ = delivery_tx.send(send_result);
+            }
+            if send_failed {
                 break;
             }
         }
@@ -96,7 +100,10 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                     break;
                 }
 
-                if send_frame(&out_tx, "ping", None, EmptyPayload {}).is_err() {
+                if send_frame(&out_tx, "ping", None, EmptyPayload {})
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -112,7 +119,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                 match message {
                     Message::Text(text) => {
                         let Ok(frame) = serde_json::from_str::<ClientFrame>(&text) else {
-                            let _ = send_error(&out_tx, None, "bad_frame", "invalid JSON frame");
+                            let _ = send_error(&out_tx, None, "bad_frame", "invalid JSON frame").await;
                             continue;
                         };
 
@@ -124,7 +131,8 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                                 frame.req_id.clone(),
                                 "rate_limited",
                                 "rate limit exceeded",
-                            );
+                            )
+                            .await;
                             continue;
                         }
 
@@ -149,7 +157,13 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                         break;
                     }
                     Message::Binary(_) => {
-                        let _ = send_error(&out_tx, None, "bad_frame", "binary frames are not supported");
+                        let _ = send_error(
+                            &out_tx,
+                            None,
+                            "bad_frame",
+                            "binary frames are not supported",
+                        )
+                        .await;
                     }
                 }
             }
@@ -166,7 +180,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
 
 async fn process_frame(
     state: &Arc<RelayState>,
-    out_tx: &mpsc::UnboundedSender<String>,
+    out_tx: &mpsc::Sender<OutboundFrame>,
     authenticated_identity: &mut Option<String>,
     rate_limit_key: &mut String,
     last_pong: &mut Instant,
@@ -180,7 +194,8 @@ async fn process_frame(
                     frame.req_id,
                     "server_busy",
                     "too many pending challenges",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -190,7 +205,8 @@ async fn process_frame(
                     frame.req_id,
                     "already_authenticated",
                     "session already authenticated",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -202,7 +218,8 @@ async fn process_frame(
                         frame.req_id,
                         "bad_payload",
                         "invalid auth_hello payload",
-                    );
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -218,7 +235,8 @@ async fn process_frame(
                         frame.req_id,
                         "auth_failed",
                         "invalid client public key",
-                    );
+                    )
+                    .await;
                     return true;
                 }
             };
@@ -228,7 +246,7 @@ async fn process_frame(
                 .challenges
                 .insert(challenge_record.challenge_id.clone(), challenge_record);
 
-            let _ = send_frame(out_tx, "auth_challenge", frame.req_id, challenge_payload);
+            let _ = send_frame(out_tx, "auth_challenge", frame.req_id, challenge_payload).await;
             false
         }
         "auth_prove" => {
@@ -238,7 +256,8 @@ async fn process_frame(
                     frame.req_id,
                     "already_authenticated",
                     "session already authenticated",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -250,7 +269,8 @@ async fn process_frame(
                         frame.req_id,
                         "bad_payload",
                         "invalid auth_prove payload",
-                    );
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -261,7 +281,8 @@ async fn process_frame(
                     frame.req_id,
                     "auth_failed",
                     "challenge not found or already used",
-                );
+                )
+                .await;
                 return true;
             };
 
@@ -273,7 +294,8 @@ async fn process_frame(
                         frame.req_id,
                         "auth_failed",
                         "proof verification failed",
-                    );
+                    )
+                    .await;
                     return true;
                 }
             };
@@ -288,7 +310,7 @@ async fn process_frame(
                 state.config.session_ttl,
             );
 
-            let _ = send_frame(
+            if send_frame(
                 out_tx,
                 "auth_ok",
                 frame.req_id,
@@ -296,15 +318,20 @@ async fn process_frame(
                     identity_hash_hex: identity_hash.clone(),
                     session_expires_at_ms: session_expires_at.timestamp_millis(),
                 },
-            );
+            )
+            .await
+            .is_err()
+            {
+                state.unregister_session(&identity_hash);
+                return true;
+            }
 
-            for queued in state.queue.drain_for_recipient(&identity_hash) {
-                let payload = MessageDeliverPayload {
-                    message_id: queued.message_id.to_string(),
-                    envelope_b64: queued.envelope_b64,
-                    queued_at_ms: queued.queued_at.timestamp_millis(),
-                };
-                let _ = send_frame(out_tx, "msg_deliver", None, payload);
+            if deliver_queued_messages(state, &identity_hash, out_tx)
+                .await
+                .is_err()
+            {
+                state.unregister_session(&identity_hash);
+                return true;
             }
 
             *rate_limit_key = identity_hash.clone();
@@ -319,7 +346,8 @@ async fn process_frame(
                     frame.req_id,
                     "unauthorized",
                     "authenticate before sending messages",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -331,7 +359,8 @@ async fn process_frame(
                         frame.req_id,
                         "bad_payload",
                         "invalid msg_send payload",
-                    );
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -342,14 +371,16 @@ async fn process_frame(
                     frame.req_id,
                     "bad_payload",
                     "recipient_hash_hex must be a 64-character hex string",
-                );
+                )
+                .await;
                 return false;
             }
 
             let message_id = match Uuid::parse_str(&payload.message_id) {
                 Ok(id) => id,
                 Err(_) => {
-                    let _ = send_error(out_tx, frame.req_id, "bad_payload", "invalid message_id");
+                    let _ =
+                        send_error(out_tx, frame.req_id, "bad_payload", "invalid message_id").await;
                     return false;
                 }
             };
@@ -362,7 +393,8 @@ async fn process_frame(
                         frame.req_id,
                         "bad_payload",
                         "invalid base64 envelope",
-                    );
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -373,7 +405,8 @@ async fn process_frame(
                     frame.req_id,
                     "too_large",
                     "message exceeds max size",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -388,29 +421,18 @@ async fn process_frame(
                 queued,
                 queue_depth: depth,
             };
-            let _ = send_frame(out_tx, "msg_accepted", frame.req_id, accepted_payload);
+            let _ = send_frame(out_tx, "msg_accepted", frame.req_id, accepted_payload).await;
 
-            if let Some(recipient_session) = state.sessions.get(&payload.recipient_hash_hex) {
-                let deliver_payload = MessageDeliverPayload {
-                    message_id: payload.message_id,
-                    envelope_b64: payload.envelope_b64,
-                    queued_at_ms: Utc::now().timestamp_millis(),
-                };
-                if send_frame(
-                    &recipient_session.sender,
-                    "msg_deliver",
-                    None,
-                    deliver_payload,
-                )
-                .is_ok()
+            let recipient_sender = state
+                .sessions
+                .get(&payload.recipient_hash_hex)
+                .map(|recipient_session| recipient_session.sender.clone());
+
+            if let Some(recipient_sender) = recipient_sender {
+                if deliver_queued_messages(state, &payload.recipient_hash_hex, &recipient_sender)
+                    .await
+                    .is_err()
                 {
-                    // Dequeue to prevent double delivery if recipient reconnects and drains
-                    drop(recipient_session);
-                    state
-                        .queue
-                        .dequeue_message(&payload.recipient_hash_hex, message_id);
-                } else {
-                    drop(recipient_session);
                     state.unregister_session(&payload.recipient_hash_hex);
                     warn!(
                         recipient = %hash_prefix(&payload.recipient_hash_hex),
@@ -431,7 +453,8 @@ async fn process_frame(
                     frame.req_id,
                     "server_busy",
                     "push registration limit reached",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -441,7 +464,8 @@ async fn process_frame(
                     frame.req_id,
                     "unauthorized",
                     "authenticate before registering push token",
-                );
+                )
+                .await;
                 return false;
             };
 
@@ -453,7 +477,8 @@ async fn process_frame(
                         frame.req_id,
                         "bad_payload",
                         "invalid push_register payload",
-                    );
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -469,7 +494,8 @@ async fn process_frame(
                     frame.req_id,
                     "bad_payload",
                     "device_token_hex must be valid hex",
-                );
+                )
+                .await;
                 return false;
             }
 
@@ -510,7 +536,7 @@ async fn process_frame(
                 "registered APNS push token"
             );
 
-            let _ = send_frame(out_tx, "push_registered", frame.req_id, EmptyPayload {});
+            let _ = send_frame(out_tx, "push_registered", frame.req_id, EmptyPayload {}).await;
             false
         }
         "pong" => {
@@ -518,11 +544,11 @@ async fn process_frame(
             false
         }
         "ping" => {
-            let _ = send_frame(out_tx, "pong", frame.req_id, EmptyPayload {});
+            let _ = send_frame(out_tx, "pong", frame.req_id, EmptyPayload {}).await;
             false
         }
         _ => {
-            let _ = send_error(out_tx, frame.req_id, "bad_frame", "unsupported frame type");
+            let _ = send_error(out_tx, frame.req_id, "bad_frame", "unsupported frame type").await;
             false
         }
     }
@@ -582,25 +608,62 @@ fn hash_prefix(value: &str) -> &str {
     &value[..prefix_len]
 }
 
-fn send_frame<T>(
-    tx: &mpsc::UnboundedSender<String>,
+async fn deliver_queued_messages(
+    state: &Arc<RelayState>,
+    recipient_hash: &str,
+    sender: &mpsc::Sender<OutboundFrame>,
+) -> Result<(), SendFrameError> {
+    for queued in state.queue.messages_for_recipient(recipient_hash) {
+        let payload = MessageDeliverPayload {
+            message_id: queued.message_id.to_string(),
+            envelope_b64: queued.envelope_b64,
+            queued_at_ms: queued.queued_at.timestamp_millis(),
+        };
+        send_frame(sender, "msg_deliver", None, payload).await?;
+        state
+            .queue
+            .dequeue_message(recipient_hash, queued.message_id);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFrameError {
+    Serialize,
+    QueueClosed,
+    QueueFull,
+    DeliveryFailed,
+}
+
+async fn send_frame<T>(
+    tx: &mpsc::Sender<OutboundFrame>,
     frame_type: &'static str,
     req_id: Option<String>,
     payload: T,
-) -> Result<(), ()>
+) -> Result<(), SendFrameError>
 where
     T: serde::Serialize,
 {
-    let serialized = frame_json(frame_type, req_id, payload).map_err(|_| ())?;
-    tx.send(serialized).map_err(|_| ())
+    let serialized =
+        frame_json(frame_type, req_id, payload).map_err(|_| SendFrameError::Serialize)?;
+    let (outbound, delivery_rx) = OutboundFrame::with_confirmation(serialized);
+    tx.try_send(outbound).map_err(|error| match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => SendFrameError::QueueFull,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => SendFrameError::QueueClosed,
+    })?;
+    delivery_rx
+        .await
+        .map_err(|_| SendFrameError::DeliveryFailed)?
+        .map_err(|_| SendFrameError::DeliveryFailed)
 }
 
-fn send_error(
-    tx: &mpsc::UnboundedSender<String>,
+async fn send_error(
+    tx: &mpsc::Sender<OutboundFrame>,
     req_id: Option<String>,
     code: &str,
     message: &str,
-) -> Result<(), ()> {
+) -> Result<(), SendFrameError> {
     send_frame(
         tx,
         "error",
@@ -610,6 +673,7 @@ fn send_error(
             message: message.to_string(),
         },
     )
+    .await
 }
 
 async fn purge_loop(state: Arc<RelayState>) {
@@ -811,14 +875,29 @@ mod tests {
         (addr, handle)
     }
 
+    fn spawn_confirming_writer(mut rx: mpsc::Receiver<OutboundFrame>) -> mpsc::Receiver<String> {
+        let (captured_tx, captured_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(outbound) = rx.recv().await {
+                let serialized = outbound.serialized.clone();
+                if let Some(delivery_tx) = outbound.delivery_tx {
+                    let _ = delivery_tx.send(Ok(()));
+                }
+                let _ = captured_tx.send(serialized).await;
+            }
+        });
+        captured_rx
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_live_delivery_cleans_up_stale_session_and_keeps_message_queued() {
         let recipient_hash = "b".repeat(64);
         let sender_hash = "a".repeat(64);
 
         let state = Arc::new(RelayState::new(test_config(10), None));
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<String>();
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let mut delivered_frames = spawn_confirming_writer(out_rx);
+        let (dead_tx, dead_rx) = mpsc::channel::<OutboundFrame>(1);
         drop(dead_rx);
 
         state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
@@ -848,13 +927,66 @@ mod tests {
         assert!(!should_close);
         assert!(state.sessions.get(&"b".repeat(64)).is_none());
 
-        let accepted = out_rx.recv().await.expect("msg_accepted");
+        let accepted = delivered_frames.recv().await.expect("msg_accepted");
         let accepted: serde_json::Value =
             serde_json::from_str(&accepted).expect("parse msg_accepted");
         assert_eq!(accepted["type"], "msg_accepted");
 
-        let queued = state.queue.drain_for_recipient(&"b".repeat(64));
+        let queued = state.queue.messages_for_recipient(&"b".repeat(64));
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_recipient_send_queue_keeps_message_queued() {
+        let recipient_hash = "b".repeat(64);
+        let sender_hash = "a".repeat(64);
+
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let _delivered_frames = spawn_confirming_writer(out_rx);
+        let (recipient_tx, _recipient_rx) = mpsc::channel::<OutboundFrame>(1);
+
+        recipient_tx
+            .try_send(OutboundFrame::fire_and_forget(
+                r#"{"type":"filler","payload":{}}"#.to_string(),
+            ))
+            .expect("fill recipient outbound queue");
+
+        state.register_session(
+            recipient_hash.clone(),
+            recipient_tx,
+            Duration::from_secs(60),
+        );
+
+        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut rate_limit_key = sender_hash;
+        let mut last_pong = Instant::now();
+        let message_id = Uuid::new_v4();
+
+        let should_close = process_frame(
+            &state,
+            &out_tx,
+            &mut authenticated_identity,
+            &mut rate_limit_key,
+            &mut last_pong,
+            ClientFrame {
+                frame_type: "msg_send".to_string(),
+                req_id: Some("req-queue-full".to_string()),
+                payload: serde_json::json!({
+                    "message_id": message_id.to_string(),
+                    "recipient_hash_hex": recipient_hash,
+                    "envelope_b64": STANDARD.encode(b"opaque-envelope"),
+                }),
+            },
+        )
+        .await;
+
+        assert!(!should_close);
+        assert!(state.sessions.get(&"b".repeat(64)).is_none());
+
+        let queued = state.queue.messages_for_recipient(&"b".repeat(64));
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, message_id);
     }
 
     async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
@@ -991,6 +1123,7 @@ mod tests {
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
+            max_session_send_queue: 128,
             challenge_ttl: Duration::from_secs(30),
             session_ttl: Duration::from_secs(3600),
             rate_limit_per_min,

@@ -76,22 +76,19 @@ impl QueueStore {
         (true, queue.len())
     }
 
-    pub fn drain_for_recipient(&self, recipient_hash: &str) -> Vec<QueuedMessage> {
+    pub fn messages_for_recipient(&self, recipient_hash: &str) -> Vec<QueuedMessage> {
         let now = Utc::now();
 
-        if let Some(mut queue) = self.queues.get_mut(recipient_hash) {
-            let drained: Vec<QueuedMessage> = queue
-                .drain(..)
-                .filter(|message| message.expires_at > now)
-                .collect();
-            for msg in &drained {
-                self.dedup
-                    .remove(&Self::dedup_key(recipient_hash, msg.message_id));
-            }
-            return drained;
-        }
-
-        Vec::new()
+        self.queues
+            .get(recipient_hash)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .filter(|message| message.expires_at > now)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn dequeue_message(&self, recipient_hash: &str, message_id: Uuid) -> bool {
