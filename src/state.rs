@@ -3,16 +3,42 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::apns::ApnsClient;
 use crate::auth::ChallengeRecord;
 use crate::config::{ApnsEnvironment, Config};
 use crate::queue::QueueStore;
 
+#[derive(Debug)]
+pub struct OutboundFrame {
+    pub serialized: String,
+    pub delivery_tx: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
+impl OutboundFrame {
+    pub fn fire_and_forget(serialized: String) -> Self {
+        Self {
+            serialized,
+            delivery_tx: None,
+        }
+    }
+
+    pub fn with_confirmation(serialized: String) -> (Self, oneshot::Receiver<Result<(), ()>>) {
+        let (delivery_tx, delivery_rx) = oneshot::channel();
+        (
+            Self {
+                serialized,
+                delivery_tx: Some(delivery_tx),
+            },
+            delivery_rx,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
-    pub sender: mpsc::UnboundedSender<String>,
+    pub sender: mpsc::Sender<OutboundFrame>,
     pub expires_at: Instant,
 }
 
@@ -83,14 +109,14 @@ impl RelayState {
     pub fn register_session(
         &self,
         identity_hash: String,
-        sender: mpsc::UnboundedSender<String>,
+        sender: mpsc::Sender<OutboundFrame>,
         session_ttl: Duration,
     ) {
         // Notify old session before replacing it (I2: session hijacking prevention)
         if let Some((_, old_handle)) = self.sessions.remove(&identity_hash) {
-            let _ = old_handle
-                .sender
-                .send(r#"{"type":"session_replaced","payload":{}}"#.to_string());
+            let _ = old_handle.sender.try_send(OutboundFrame::fire_and_forget(
+                r#"{"type":"session_replaced","payload":{}}"#.to_string(),
+            ));
         }
 
         let now = Instant::now();
