@@ -301,7 +301,6 @@ async fn process_frame(
             for queued in state.queue.drain_for_recipient(&identity_hash) {
                 let payload = MessageDeliverPayload {
                     message_id: queued.message_id.to_string(),
-                    sender_hash_hex: queued.sender_hash,
                     envelope_b64: queued.envelope_b64,
                     queued_at_ms: queued.queued_at.timestamp_millis(),
                 };
@@ -314,7 +313,7 @@ async fn process_frame(
             false
         }
         "msg_send" => {
-            let Some(sender_hash) = authenticated_identity.as_ref() else {
+            if authenticated_identity.is_none() {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -322,7 +321,7 @@ async fn process_frame(
                     "authenticate before sending messages",
                 );
                 return false;
-            };
+            }
 
             let payload = match parse_payload::<MessageSendPayload>(&mut frame) {
                 Ok(payload) => payload,
@@ -379,7 +378,6 @@ async fn process_frame(
             }
 
             let (queued, depth) = state.queue.enqueue(
-                sender_hash.clone(),
                 payload.recipient_hash_hex.clone(),
                 message_id,
                 payload.envelope_b64.clone(),
@@ -395,7 +393,6 @@ async fn process_frame(
             if let Some(recipient_session) = state.sessions.get(&payload.recipient_hash_hex) {
                 let deliver_payload = MessageDeliverPayload {
                     message_id: payload.message_id,
-                    sender_hash_hex: sender_hash.clone(),
                     envelope_b64: payload.envelope_b64,
                     queued_at_ms: Utc::now().timestamp_millis(),
                 };
@@ -411,7 +408,7 @@ async fn process_frame(
                     drop(recipient_session);
                     state
                         .queue
-                        .ack_message(&payload.recipient_hash_hex, message_id);
+                        .dequeue_message(&payload.recipient_hash_hex, message_id);
                 } else {
                     drop(recipient_session);
                     state.unregister_session(&payload.recipient_hash_hex);
@@ -749,7 +746,6 @@ mod tests {
         let deliver = recv_json(&mut recipient.socket).await;
         assert_eq!(deliver["type"], "msg_deliver");
         assert_eq!(deliver["payload"]["message_id"], message_id);
-        assert_eq!(deliver["payload"]["sender_hash_hex"], sender.identity_hash);
         assert_eq!(deliver["payload"]["envelope_b64"], envelope_b64);
 
         server_task.abort();
