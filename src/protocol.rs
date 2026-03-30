@@ -73,17 +73,6 @@ pub struct MessageDeliverPayload {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct MessageAckPayload {
-    pub message_id: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct MessageAckedPayload {
-    pub message_id: String,
-    pub acked_at_ms: i64,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct PushRegisterPayload {
     pub device_token_hex: String,
     pub apns_env: Option<String>,
