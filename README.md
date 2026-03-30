@@ -24,9 +24,6 @@ The relay never decrypts, inspects, or logs message contents. It stores and forw
           +----------> [ Queue ] ------------>+
           |         never decrypted       msg_deliver
           |                                   |
-          |   3. msg_ack                      |
-          +<----------- msg_acked <-----------+
-          |                                   |
           |   If offline:                     |
           |   APNS silent push -------> wake  |
           |                                   |
@@ -44,11 +41,13 @@ Every message between clients is encrypted end-to-end with AES-256-GCM before it
 
 ## Key Design Decisions
 
-**Zero-knowledge relay.** The server cannot read messages. The `envelope_b64` field is an opaque encrypted blob. Sender-recipient correlation uses SHA-256 hashes of public keys, not human-readable identifiers.
+**Zero-knowledge relay.** The server cannot read messages and cannot correlate senders with recipients. The `envelope_b64` field is an opaque encrypted blob. The relay knows only the recipient hash (needed for routing) -- the sender's identity is never attached to forwarded messages.
 
 **Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
 
 **Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+
+**Sealed sender.** The relay authenticates senders for rate limiting but does not record or forward sender identity. `msg_deliver` contains only the encrypted envelope, message ID, and timestamp -- never the sender's identity hash. This prevents the server from building a social graph of who communicates with whom. Delivery acknowledgments are handled end-to-end inside encrypted envelopes rather than as a server-mediated protocol feature.
 
 **Bridge-transparent.** A bridge phone that relays traffic for nearby BLE-only peers doesn't need special server-side logic. Each tunneled peer authenticates as itself over its own WebSocket session. Multiple identities behind the same NAT/IP are expected and rate-limited independently.
 
@@ -93,9 +92,7 @@ All frames are JSON with a `type` field:
 | `auth_ok` | server -> client | Authentication succeeded, identity hash assigned |
 | `msg_send` | client -> server | Send encrypted envelope to recipient hash |
 | `msg_accepted` | server -> client | Envelope queued, with queue depth |
-| `msg_deliver` | server -> client | Deliver envelope to recipient |
-| `msg_ack` | client -> server | Acknowledge receipt of message |
-| `msg_acked` | server -> client | Notify sender their message was acknowledged |
+| `msg_deliver` | server -> client | Deliver envelope to recipient (sealed: no sender identity) |
 | `push_register` | client -> server | Register APNS device token |
 | `ping` / `pong` | bidirectional | Keepalive |
 | `error` | server -> client | Error with code and message |

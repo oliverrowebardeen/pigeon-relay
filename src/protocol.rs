@@ -67,20 +67,8 @@ pub struct MessageAcceptedPayload {
 #[derive(Debug, Serialize, Clone)]
 pub struct MessageDeliverPayload {
     pub message_id: String,
-    pub sender_hash_hex: String,
     pub envelope_b64: String,
     pub queued_at_ms: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MessageAckPayload {
-    pub message_id: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct MessageAckedPayload {
-    pub message_id: String,
-    pub acked_at_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]

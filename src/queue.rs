@@ -8,7 +8,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
     pub message_id: Uuid,
-    pub sender_hash: String,
     pub recipient_hash: String,
     pub envelope_b64: String,
     pub queued_at: DateTime<Utc>,
@@ -35,7 +34,6 @@ impl QueueStore {
 
     pub fn enqueue(
         &self,
-        sender_hash: String,
         recipient_hash: String,
         message_id: Uuid,
         envelope_b64: String,
@@ -55,7 +53,6 @@ impl QueueStore {
 
         let entry = QueuedMessage {
             message_id,
-            sender_hash,
             recipient_hash: recipient_hash.clone(),
             envelope_b64,
             queued_at: now,
@@ -97,13 +94,14 @@ impl QueueStore {
         Vec::new()
     }
 
-    pub fn ack_message(&self, recipient_hash: &str, message_id: Uuid) -> Option<QueuedMessage> {
-        let mut removed = None;
+    pub fn dequeue_message(&self, recipient_hash: &str, message_id: Uuid) -> bool {
+        let mut removed = false;
 
         if let Some(mut queue) = self.queues.get_mut(recipient_hash)
             && let Some(index) = queue.iter().position(|item| item.message_id == message_id)
         {
-            removed = queue.remove(index);
+            queue.remove(index);
+            removed = true;
         }
 
         self.dedup
@@ -142,11 +140,10 @@ mod tests {
     fn dedup_prevents_duplicate_enqueue() {
         let queue = QueueStore::new(Duration::from_secs(3600), 100);
         let recipient = "abcd".to_string();
-        let sender = "efgh".to_string();
         let id = Uuid::new_v4();
 
-        let first = queue.enqueue(sender.clone(), recipient.clone(), id, "blob".to_string());
-        let second = queue.enqueue(sender, recipient.clone(), id, "blob".to_string());
+        let first = queue.enqueue(recipient.clone(), id, "blob".to_string());
+        let second = queue.enqueue(recipient.clone(), id, "blob".to_string());
 
         assert!(first.0);
         assert!(!second.0);

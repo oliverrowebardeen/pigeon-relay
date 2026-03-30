@@ -22,8 +22,8 @@ use crate::auth;
 use crate::config::ApnsEnvironment;
 use crate::protocol::{
     AuthHelloPayload, AuthOkPayload, AuthProvePayload, ClientFrame, EmptyPayload, ErrorPayload,
-    MessageAcceptedPayload, MessageAckPayload, MessageAckedPayload, MessageDeliverPayload,
-    MessageSendPayload, PushRegisterPayload, frame_json, parse_payload,
+    MessageAcceptedPayload, MessageDeliverPayload, MessageSendPayload, PushRegisterPayload,
+    frame_json, parse_payload,
 };
 use crate::state::{PushRegistration, RelayState};
 
@@ -301,15 +301,10 @@ async fn process_frame(
             for queued in state.queue.drain_for_recipient(&identity_hash) {
                 let payload = MessageDeliverPayload {
                     message_id: queued.message_id.to_string(),
-                    sender_hash_hex: queued.sender_hash,
                     envelope_b64: queued.envelope_b64,
                     queued_at_ms: queued.queued_at.timestamp_millis(),
                 };
                 let _ = send_frame(out_tx, "msg_deliver", None, payload);
-            }
-
-            for pending_ack in state.take_pending_acks(&identity_hash) {
-                let _ = send_frame(out_tx, "msg_acked", None, pending_ack);
             }
 
             *rate_limit_key = identity_hash.clone();
@@ -318,7 +313,7 @@ async fn process_frame(
             false
         }
         "msg_send" => {
-            let Some(sender_hash) = authenticated_identity.as_ref() else {
+            if authenticated_identity.is_none() {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -326,7 +321,7 @@ async fn process_frame(
                     "authenticate before sending messages",
                 );
                 return false;
-            };
+            }
 
             let payload = match parse_payload::<MessageSendPayload>(&mut frame) {
                 Ok(payload) => payload,
@@ -383,7 +378,6 @@ async fn process_frame(
             }
 
             let (queued, depth) = state.queue.enqueue(
-                sender_hash.clone(),
                 payload.recipient_hash_hex.clone(),
                 message_id,
                 payload.envelope_b64.clone(),
@@ -399,7 +393,6 @@ async fn process_frame(
             if let Some(recipient_session) = state.sessions.get(&payload.recipient_hash_hex) {
                 let deliver_payload = MessageDeliverPayload {
                     message_id: payload.message_id,
-                    sender_hash_hex: sender_hash.clone(),
                     envelope_b64: payload.envelope_b64,
                     queued_at_ms: Utc::now().timestamp_millis(),
                 };
@@ -415,7 +408,7 @@ async fn process_frame(
                     drop(recipient_session);
                     state
                         .queue
-                        .ack_message(&payload.recipient_hash_hex, message_id);
+                        .dequeue_message(&payload.recipient_hash_hex, message_id);
                 } else {
                     drop(recipient_session);
                     state.unregister_session(&payload.recipient_hash_hex);
@@ -427,64 +420,6 @@ async fn process_frame(
                 }
             } else {
                 maybe_trigger_apns(state, &payload.recipient_hash_hex).await;
-            }
-
-            false
-        }
-        "msg_ack" => {
-            let Some(recipient_hash) = authenticated_identity.as_ref() else {
-                let _ = send_error(
-                    out_tx,
-                    frame.req_id,
-                    "unauthorized",
-                    "authenticate before acking messages",
-                );
-                return false;
-            };
-
-            let payload = match parse_payload::<MessageAckPayload>(&mut frame) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "bad_payload",
-                        "invalid msg_ack payload",
-                    );
-                    return false;
-                }
-            };
-
-            let message_id = match Uuid::parse_str(&payload.message_id) {
-                Ok(id) => id,
-                Err(_) => {
-                    let _ = send_error(out_tx, frame.req_id, "bad_payload", "invalid message_id");
-                    return false;
-                }
-            };
-
-            if let Some(acked_message) = state.queue.ack_message(recipient_hash, message_id) {
-                let ack_payload = MessageAckedPayload {
-                    message_id: payload.message_id,
-                    acked_at_ms: Utc::now().timestamp_millis(),
-                };
-
-                if let Some(sender_session) = state.sessions.get(&acked_message.sender_hash) {
-                    if send_frame(
-                        &sender_session.sender,
-                        "msg_acked",
-                        None,
-                        ack_payload.clone(),
-                    )
-                    .is_err()
-                    {
-                        drop(sender_session);
-                        state.unregister_session(&acked_message.sender_hash);
-                        state.store_pending_ack(&acked_message.sender_hash, ack_payload);
-                    }
-                } else {
-                    state.store_pending_ack(&acked_message.sender_hash, ack_payload);
-                }
             }
 
             false
@@ -811,8 +746,52 @@ mod tests {
         let deliver = recv_json(&mut recipient.socket).await;
         assert_eq!(deliver["type"], "msg_deliver");
         assert_eq!(deliver["payload"]["message_id"], message_id);
-        assert_eq!(deliver["payload"]["sender_hash_hex"], sender.identity_hash);
         assert_eq!(deliver["payload"]["envelope_b64"], envelope_b64);
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sealed_sender_deliver_payload_contains_no_sender_identity() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let mut sender = connect_authenticated_client(addr).await;
+        let mut recipient = connect_authenticated_client(addr).await;
+        let message_id = Uuid::new_v4().to_string();
+        let envelope_b64 = STANDARD.encode(b"opaque-envelope");
+
+        send_json(
+            &mut sender.socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": message_id,
+                    "recipient_hash_hex": recipient.identity_hash,
+                    "envelope_b64": envelope_b64
+                }
+            }),
+        )
+        .await;
+
+        let _accepted = recv_json(&mut sender.socket).await;
+        let deliver = recv_json(&mut recipient.socket).await;
+        assert_eq!(deliver["type"], "msg_deliver");
+        assert_eq!(deliver["payload"]["message_id"], message_id);
+        assert_eq!(deliver["payload"]["envelope_b64"], envelope_b64);
+
+        // Sealed sender: no sender identity in delivery payload
+        assert!(deliver["payload"].get("sender_hash_hex").is_none());
+
+        // Only expected fields present
+        let payload_obj = deliver["payload"].as_object().unwrap();
+        let keys: std::collections::HashSet<&str> =
+            payload_obj.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["message_id", "envelope_b64", "queued_at_ms"]
+                .into_iter()
+                .collect()
+        );
 
         server_task.abort();
     }
