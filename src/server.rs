@@ -429,10 +429,19 @@ async fn process_frame(
                 .map(|recipient_session| recipient_session.sender.clone());
 
             if let Some(recipient_sender) = recipient_sender {
-                if deliver_queued_messages(state, &payload.recipient_hash_hex, &recipient_sender)
+                let deliver_payload = MessageDeliverPayload {
+                    message_id: payload.message_id,
+                    envelope_b64: payload.envelope_b64,
+                    queued_at_ms: Utc::now().timestamp_millis(),
+                };
+                if send_frame(&recipient_sender, "msg_deliver", None, deliver_payload)
                     .await
-                    .is_err()
+                    .is_ok()
                 {
+                    state
+                        .queue
+                        .dequeue_message(&payload.recipient_hash_hex, message_id);
+                } else {
                     state.unregister_session(&payload.recipient_hash_hex);
                     warn!(
                         recipient = %hash_prefix(&payload.recipient_hash_hex),
