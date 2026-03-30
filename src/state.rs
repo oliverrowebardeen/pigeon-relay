@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +8,6 @@ use tokio::sync::mpsc;
 use crate::apns::ApnsClient;
 use crate::auth::ChallengeRecord;
 use crate::config::{ApnsEnvironment, Config};
-use crate::protocol::MessageAckedPayload;
 use crate::queue::QueueStore;
 
 #[derive(Debug, Clone)]
@@ -39,7 +37,6 @@ pub struct RelayState {
     pub queue: QueueStore,
     pub sessions: DashMap<String, SessionHandle>,
     pub challenges: DashMap<String, ChallengeRecord>,
-    pub pending_acks: DashMap<String, (Instant, VecDeque<MessageAckedPayload>)>,
     pub push_tokens: DashMap<String, PushRegistration>,
     rate_limits: DashMap<String, RateLimitWindow>,
     pub apns_client: Option<Arc<ApnsClient>>,
@@ -54,7 +51,6 @@ impl RelayState {
             queue,
             sessions: DashMap::new(),
             challenges: DashMap::new(),
-            pending_acks: DashMap::new(),
             push_tokens: DashMap::new(),
             rate_limits: DashMap::new(),
             apns_client,
@@ -109,23 +105,6 @@ impl RelayState {
         self.sessions.remove(identity_hash);
     }
 
-    pub fn store_pending_ack(&self, sender_hash: &str, payload: MessageAckedPayload) {
-        let now = Instant::now();
-        let mut entry = self
-            .pending_acks
-            .entry(sender_hash.to_string())
-            .or_insert_with(|| (now, VecDeque::new()));
-        entry.0 = now;
-        entry.1.push_back(payload);
-    }
-
-    pub fn take_pending_acks(&self, sender_hash: &str) -> Vec<MessageAckedPayload> {
-        if let Some((_, (_, pending))) = self.pending_acks.remove(sender_hash) {
-            return pending.into_iter().collect();
-        }
-        Vec::new()
-    }
-
     pub fn maybe_record_push(&self, recipient_hash: &str, cooldown: Duration) -> bool {
         let Some(mut push) = self.push_tokens.get_mut(recipient_hash) else {
             return false;
@@ -151,8 +130,6 @@ impl RelayState {
         self.sessions.retain(|_, session| session.expires_at > now);
         self.rate_limits
             .retain(|_, window| now.duration_since(window.started_at) <= Duration::from_secs(300));
-        self.pending_acks
-            .retain(|_, (stored_at, _)| now.duration_since(*stored_at) <= self.config.session_ttl);
         self.push_tokens
             .retain(|_, reg| now.duration_since(reg.registered_at) <= self.config.push_token_ttl);
 

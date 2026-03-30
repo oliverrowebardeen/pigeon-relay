@@ -22,8 +22,8 @@ use crate::auth;
 use crate::config::ApnsEnvironment;
 use crate::protocol::{
     AuthHelloPayload, AuthOkPayload, AuthProvePayload, ClientFrame, EmptyPayload, ErrorPayload,
-    MessageAcceptedPayload, MessageAckPayload, MessageAckedPayload, MessageDeliverPayload,
-    MessageSendPayload, PushRegisterPayload, frame_json, parse_payload,
+    MessageAcceptedPayload, MessageDeliverPayload, MessageSendPayload, PushRegisterPayload,
+    frame_json, parse_payload,
 };
 use crate::state::{PushRegistration, RelayState};
 
@@ -308,10 +308,6 @@ async fn process_frame(
                 let _ = send_frame(out_tx, "msg_deliver", None, payload);
             }
 
-            for pending_ack in state.take_pending_acks(&identity_hash) {
-                let _ = send_frame(out_tx, "msg_acked", None, pending_ack);
-            }
-
             *rate_limit_key = identity_hash.clone();
             *authenticated_identity = Some(identity_hash);
 
@@ -427,64 +423,6 @@ async fn process_frame(
                 }
             } else {
                 maybe_trigger_apns(state, &payload.recipient_hash_hex).await;
-            }
-
-            false
-        }
-        "msg_ack" => {
-            let Some(recipient_hash) = authenticated_identity.as_ref() else {
-                let _ = send_error(
-                    out_tx,
-                    frame.req_id,
-                    "unauthorized",
-                    "authenticate before acking messages",
-                );
-                return false;
-            };
-
-            let payload = match parse_payload::<MessageAckPayload>(&mut frame) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "bad_payload",
-                        "invalid msg_ack payload",
-                    );
-                    return false;
-                }
-            };
-
-            let message_id = match Uuid::parse_str(&payload.message_id) {
-                Ok(id) => id,
-                Err(_) => {
-                    let _ = send_error(out_tx, frame.req_id, "bad_payload", "invalid message_id");
-                    return false;
-                }
-            };
-
-            if let Some(acked_message) = state.queue.ack_message(recipient_hash, message_id) {
-                let ack_payload = MessageAckedPayload {
-                    message_id: payload.message_id,
-                    acked_at_ms: Utc::now().timestamp_millis(),
-                };
-
-                if let Some(sender_session) = state.sessions.get(&acked_message.sender_hash) {
-                    if send_frame(
-                        &sender_session.sender,
-                        "msg_acked",
-                        None,
-                        ack_payload.clone(),
-                    )
-                    .is_err()
-                    {
-                        drop(sender_session);
-                        state.unregister_session(&acked_message.sender_hash);
-                        state.store_pending_ack(&acked_message.sender_hash, ack_payload);
-                    }
-                } else {
-                    state.store_pending_ack(&acked_message.sender_hash, ack_payload);
-                }
             }
 
             false
