@@ -18,6 +18,7 @@ pub struct Config {
     pub max_concurrent_challenges: usize,
     pub max_push_registrations: usize,
     pub push_token_ttl: Duration,
+    pub allow_legacy_send: bool,
     pub apns: ApnsConfig,
 }
 
@@ -78,6 +79,7 @@ impl Config {
         let max_concurrent_challenges = parse_num("RELAY_MAX_CHALLENGES", "10000")?;
         let max_push_registrations = parse_num("RELAY_MAX_PUSH_REGISTRATIONS", "100000")?;
         let push_token_ttl = parse_duration("RELAY_PUSH_TOKEN_TTL", "720h")?;
+        let allow_legacy_send = parse_bool("RELAY_ALLOW_LEGACY_SEND", true);
 
         let apns_enabled = parse_bool("APNS_ENABLED", false);
         let apns_environment = parse_apns_environment(env::var("APNS_ENV").ok());
@@ -152,6 +154,7 @@ impl Config {
             max_concurrent_challenges,
             max_push_registrations,
             push_token_ttl,
+            allow_legacy_send,
             apns,
         })
     }
