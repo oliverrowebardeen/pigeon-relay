@@ -1034,21 +1034,6 @@ mod tests {
         server_task.abort();
     }
 
-    async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let state = Arc::new(RelayState::new(config, None));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("read test server addr");
-        let router = app(state);
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("serve test router");
-        });
-        (addr, handle)
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_live_delivery_cleans_up_stale_session_and_keeps_message_queued() {
         let recipient_hash = "b".repeat(64);
@@ -1097,6 +1082,120 @@ mod tests {
 
         let queued = state.queue.drain_for_recipient(&"b".repeat(64));
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_register_rejected_on_send_connection() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let (mut socket, _) = connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .expect("connect");
+
+        // First frame is msg_send - assigns Send role
+        send_json(
+            &mut socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": Uuid::new_v4().to_string(),
+                    "recipient_hash_hex": "a".repeat(64),
+                    "envelope_b64": STANDARD.encode(b"test")
+                }
+            }),
+        )
+        .await;
+        let _ = recv_json(&mut socket).await;
+
+        // Try push_register on a send connection
+        send_json(
+            &mut socket,
+            json!({
+                "type": "push_register",
+                "payload": {
+                    "device_token_hex": "aabb",
+                    "apns_env": "sandbox"
+                }
+            }),
+        )
+        .await;
+
+        let error = recv_json(&mut socket).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["payload"]["code"], "unauthorized");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_first_frame_rejected() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let (mut socket, _) = connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .expect("connect");
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "push_register",
+                "payload": {
+                    "device_token_hex": "aabb",
+                    "apns_env": "sandbox"
+                }
+            }),
+        )
+        .await;
+
+        let error = recv_json(&mut socket).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["payload"]["code"], "bad_frame");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn msg_send_on_receive_connection_allowed_when_legacy_on() {
+        let mut config = test_config(10);
+        config.allow_legacy_send = true;
+        let (addr, server_task) = spawn_test_server(config).await;
+
+        let mut client = connect_authenticated_client(addr).await;
+        let message_id = Uuid::new_v4().to_string();
+        let envelope_b64 = STANDARD.encode(b"legacy-send-test");
+
+        send_json(
+            &mut client.socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": message_id,
+                    "recipient_hash_hex": "a".repeat(64),
+                    "envelope_b64": envelope_b64
+                }
+            }),
+        )
+        .await;
+
+        let accepted = recv_json(&mut client.socket).await;
+        assert_eq!(accepted["type"], "msg_accepted");
+
+        server_task.abort();
+    }
+
+    async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let state = Arc::new(RelayState::new(config, None));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server addr");
+        let router = app(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (addr, handle)
     }
 
     async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
