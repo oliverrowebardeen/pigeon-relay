@@ -94,6 +94,8 @@ All frames are JSON with a `type` field:
 | `msg_accepted` | server -> client | Envelope queued, with queue depth |
 | `msg_deliver` | server -> client | Deliver envelope to recipient (sealed: no sender identity) |
 | `push_register` | client -> server | Register APNS device token |
+| `push_registered` | server -> client | APNS token registration confirmed |
+| `session_replaced` | server -> client | Another session authenticated with your identity |
 | `ping` / `pong` | bidirectional | Keepalive |
 | `error` | server -> client | Error with code and message |
 
@@ -141,6 +143,9 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |
 | `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
 | `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
+| `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
+| `RELAY_MAX_PUSH_REGISTRATIONS` | `100000` | Maximum stored APNS device tokens |
+| `RELAY_PUSH_TOKEN_TTL` | `720h` | APNS device token expiry |
 
 ### APNS Configuration
 
@@ -216,7 +221,7 @@ CI runs on every push and pull request:
 
 ## Deployment
 
-The relay runs as a systemd service. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
+The relay is designed to run as a systemd service. No `.service` file is included -- create one for your environment. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
 
 **Server layout:**
 

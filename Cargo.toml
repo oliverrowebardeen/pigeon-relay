@@ -2,8 +2,10 @@
 name = "pigeon-relay"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Minimal authenticated websocket relay for Pigeon encrypted message envelopes"
 license = "MIT"
+repository = "https://github.com/oliverrowebardeen/pigeon-relay"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "macros"] }
