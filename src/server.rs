@@ -188,6 +188,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_frame(
     state: &Arc<RelayState>,
     out_tx: &mpsc::Sender<OutboundFrame>,
