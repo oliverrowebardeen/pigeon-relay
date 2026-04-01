@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::ws::close_code;
 use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -14,6 +15,13 @@ use crate::queue::QueueStore;
 pub struct OutboundFrame {
     pub serialized: String,
     pub delivery_tx: Option<oneshot::Sender<Result<(), ()>>>,
+    pub close_after_send: Option<CloseDirective>,
+}
+
+#[derive(Debug)]
+pub struct CloseDirective {
+    pub code: u16,
+    pub reason: String,
 }
 
 impl OutboundFrame {
@@ -21,6 +29,7 @@ impl OutboundFrame {
         Self {
             serialized,
             delivery_tx: None,
+            close_after_send: None,
         }
     }
 
@@ -30,9 +39,25 @@ impl OutboundFrame {
             Self {
                 serialized,
                 delivery_tx: Some(delivery_tx),
+                close_after_send: None,
             },
             delivery_rx,
         )
+    }
+
+    pub fn fire_and_forget_and_close(
+        serialized: String,
+        code: u16,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            serialized,
+            delivery_tx: None,
+            close_after_send: Some(CloseDirective {
+                code,
+                reason: reason.into(),
+            }),
+        }
     }
 }
 
@@ -114,9 +139,13 @@ impl RelayState {
     ) {
         // Notify old session before replacing it (I2: session hijacking prevention)
         if let Some((_, old_handle)) = self.sessions.remove(&identity_hash) {
-            let _ = old_handle.sender.try_send(OutboundFrame::fire_and_forget(
-                r#"{"type":"session_replaced","payload":{}}"#.to_string(),
-            ));
+            let _ = old_handle
+                .sender
+                .try_send(OutboundFrame::fire_and_forget_and_close(
+                    r#"{"type":"session_replaced","payload":{}}"#.to_string(),
+                    close_code::POLICY,
+                    "session replaced",
+                ));
         }
 
         let now = Instant::now();
