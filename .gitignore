@@ -1,5 +1,6 @@
 /target
 .env
+.env.*
 .DS_Store
 *.p8
 *.pem

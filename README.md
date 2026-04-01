@@ -41,13 +41,13 @@ Every message between clients is encrypted end-to-end with AES-256-GCM before it
 
 ## Key Design Decisions
 
-**Zero-knowledge relay.** The server cannot read messages and cannot correlate senders with recipients. The `envelope_b64` field is an opaque encrypted blob. The relay knows only the recipient hash (needed for routing) -- the sender's identity is never attached to forwarded messages.
+**Zero-knowledge relay.** The server cannot read messages. Send connections are anonymous -- the relay processes `msg_send` without knowing or asking for sender identity. Receive connections are authenticated for message delivery. The relay cannot link the two at the protocol level, preventing sender-recipient correlation.
 
 **Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
 
 **Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
 
-**Sealed sender.** The relay authenticates senders for rate limiting but does not record or forward sender identity. `msg_deliver` contains only the encrypted envelope, message ID, and timestamp -- never the sender's identity hash. This prevents the server from building a social graph of who communicates with whom. Delivery acknowledgments are handled end-to-end inside encrypted envelopes rather than as a server-mediated protocol feature.
+**Sealed sender.** Message sending is fully anonymous. Send connections carry no authentication -- the relay has no sender identity in the send path. Receive connections are authenticated solely for delivery routing. `msg_deliver` contains only the encrypted envelope, message ID, and timestamp. The relay cannot build a social graph because it architecturally cannot identify who is sending.
 
 **Bridge-transparent.** A bridge phone that relays traffic for nearby BLE-only peers doesn't need special server-side logic. Each tunneled peer authenticates as itself over its own WebSocket session. Multiple identities behind the same NAT/IP are expected and rate-limited independently.
 
@@ -82,6 +82,8 @@ Client                          Relay
 
 WebSocket endpoint: `/v1/ws`
 
+Connections have a **role** determined by their first frame: `auth_hello` assigns the **receive** role, `msg_send` assigns the **send** role. Roles are immutable for the lifetime of the connection.
+
 All frames are JSON with a `type` field:
 
 | Frame | Direction | Description |
@@ -94,6 +96,8 @@ All frames are JSON with a `type` field:
 | `msg_accepted` | server -> client | Envelope queued, with queue depth |
 | `msg_deliver` | server -> client | Deliver envelope to recipient (sealed: no sender identity) |
 | `push_register` | client -> server | Register APNS device token |
+| `push_registered` | server -> client | APNS token registration confirmed |
+| `session_replaced` | server -> client | Another session authenticated with your identity |
 | `ping` / `pong` | bidirectional | Keepalive |
 | `error` | server -> client | Error with code and message |
 
@@ -142,6 +146,10 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |
 | `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
 | `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
+| `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
+| `RELAY_MAX_PUSH_REGISTRATIONS` | `100000` | Maximum stored APNS device tokens |
+| `RELAY_PUSH_TOKEN_TTL` | `720h` | APNS device token expiry |
+| `RELAY_ALLOW_LEGACY_SEND` | `true` | Allow `msg_send` on authenticated (receive) connections for old clients |
 
 ### APNS Configuration
 
@@ -175,8 +183,8 @@ The push payload is a silent background notification:
 
 Rate limiting is scoped to prevent abuse while supporting bridge mode:
 
-- **Before authentication:** per WebSocket connection (`anon:<connection-id>`)
-- **After authentication:** per identity hash
+- **Send connections (anonymous):** per WebSocket connection (`anon:<connection-id>`)
+- **Receive connections (authenticated):** per identity hash after authentication, per connection before
 
 This means multiple BLE-only peers tunneled through a single bridge phone each get their own rate limit budget, rather than sharing one.
 
@@ -217,7 +225,7 @@ CI runs on every push and pull request:
 
 ## Deployment
 
-The relay runs as a systemd service. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
+The relay is designed to run as a systemd service. No `.service` file is included -- create one for your environment. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
 
 **Server layout:**
 
