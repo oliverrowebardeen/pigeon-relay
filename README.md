@@ -140,6 +140,7 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |
 | `RELAY_MAX_MESSAGE_BYTES` | `65536` | Maximum envelope size |
 | `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap |
+| `RELAY_MAX_SESSION_SEND_QUEUE` | `128` | Per-websocket outbound buffer cap before the session is treated as stale |
 | `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
 | `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
 | `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |

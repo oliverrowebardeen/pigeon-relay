@@ -10,6 +10,7 @@ pub struct Config {
     pub message_ttl: Duration,
     pub max_message_bytes: usize,
     pub max_queue_per_recipient: usize,
+    pub max_session_send_queue: usize,
     pub challenge_ttl: Duration,
     pub session_ttl: Duration,
     pub rate_limit_per_min: u32,
@@ -71,6 +72,7 @@ impl Config {
         let message_ttl = parse_duration("RELAY_MESSAGE_TTL", "168h")?;
         let max_message_bytes = parse_num("RELAY_MAX_MESSAGE_BYTES", "65536")?;
         let max_queue_per_recipient = parse_num("RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
+        let max_session_send_queue = parse_num("RELAY_MAX_SESSION_SEND_QUEUE", "128")?;
         let challenge_ttl = parse_duration("RELAY_CHALLENGE_TTL", "30s")?;
         let session_ttl = parse_duration("RELAY_SESSION_TTL", "24h")?;
         let rate_limit_per_min = parse_num("RELAY_RATE_LIMIT_PER_MIN", "60")?;
@@ -146,6 +148,7 @@ impl Config {
             message_ttl,
             max_message_bytes,
             max_queue_per_recipient,
+            max_session_send_queue,
             challenge_ttl,
             session_ttl,
             rate_limit_per_min,
