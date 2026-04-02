@@ -228,6 +228,8 @@ CI runs on every push and pull request:
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
+- `cargo deny check advisories bans licenses sources`
+- `gitleaks`
 
 ## Deployment
 
