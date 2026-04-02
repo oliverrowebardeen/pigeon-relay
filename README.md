@@ -149,7 +149,7 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
 | `RELAY_MAX_PUSH_REGISTRATIONS` | `100000` | Maximum stored APNS device tokens |
 | `RELAY_PUSH_TOKEN_TTL` | `720h` | APNS device token expiry |
-| `RELAY_ALLOW_LEGACY_SEND` | `true` | Allow `msg_send` on authenticated (receive) connections for old clients |
+| `RELAY_ALLOW_LEGACY_SEND` | `false` | Allow `msg_send` on authenticated (receive) connections for old clients |
 
 ### APNS Configuration
 
@@ -187,6 +187,12 @@ Rate limiting is scoped to prevent abuse while supporting bridge mode:
 - **Receive connections (authenticated):** per identity hash after authentication, per connection before
 
 This means multiple BLE-only peers tunneled through a single bridge phone each get their own rate limit budget, rather than sharing one.
+
+## Legacy Compatibility
+
+`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated anonymous send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
+
+Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older clients that have not yet migrated.
 
 ## Bridge / NAT Behavior
 
