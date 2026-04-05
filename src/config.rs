@@ -81,7 +81,7 @@ impl Config {
         let max_concurrent_challenges = parse_num("RELAY_MAX_CHALLENGES", "10000")?;
         let max_push_registrations = parse_num("RELAY_MAX_PUSH_REGISTRATIONS", "100000")?;
         let push_token_ttl = parse_duration("RELAY_PUSH_TOKEN_TTL", "720h")?;
-        let allow_legacy_send = parse_bool("RELAY_ALLOW_LEGACY_SEND", true);
+        let allow_legacy_send = parse_bool("RELAY_ALLOW_LEGACY_SEND", false);
 
         let apns_enabled = parse_bool("APNS_ENABLED", false);
         let apns_environment = parse_apns_environment(env::var("APNS_ENV").ok());

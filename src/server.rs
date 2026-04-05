@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -65,9 +65,14 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
-    let max_size = state.config.max_message_bytes + 4096; // headroom for JSON framing
-    ws.max_message_size(max_size)
+    ws.max_message_size(max_ws_frame_size(state.config.max_message_bytes))
         .on_upgrade(move |socket| handle_socket(state, socket))
+}
+
+fn max_ws_frame_size(max_message_bytes: usize) -> usize {
+    // `msg_send` carries the envelope base64-encoded inside a JSON text frame.
+    let envelope_b64_bytes = max_message_bytes.div_ceil(3).saturating_mul(4);
+    envelope_b64_bytes.saturating_add(1024)
 }
 
 async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
@@ -77,6 +82,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
 
     let writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
+            let close_after_send = outbound.close_after_send;
             let send_result = ws_sender
                 .send(Message::Text(outbound.serialized.into()))
                 .await
@@ -86,6 +92,16 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                 let _ = delivery_tx.send(send_result);
             }
             if send_failed {
+                break;
+            }
+
+            if let Some(close_after_send) = close_after_send {
+                let _ = ws_sender
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_after_send.code,
+                        reason: close_after_send.reason.into(),
+                    })))
+                    .await;
                 break;
             }
         }
@@ -796,6 +812,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     use crate::auth;
@@ -983,6 +1000,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_sized_message_is_accepted_by_websocket_transport() {
+        let mut config = test_config(10);
+        config.max_message_bytes = 16_384;
+        let (addr, server_task) = spawn_test_server(config.clone()).await;
+
+        let (mut sender_socket, _) = connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .expect("connect sender");
+        let envelope_b64 = STANDARD.encode(vec![0_u8; config.max_message_bytes]);
+
+        send_json(
+            &mut sender_socket,
+            json!({
+                "type": "msg_send",
+                "payload": {
+                    "message_id": Uuid::new_v4().to_string(),
+                    "recipient_hash_hex": "a".repeat(64),
+                    "envelope_b64": envelope_b64
+                }
+            }),
+        )
+        .await;
+
+        let accepted = recv_json(&mut sender_socket).await;
+        assert_eq!(accepted["type"], "msg_accepted");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn msg_send_rejected_on_receive_connection_when_legacy_off() {
         let mut config = test_config(10);
         config.allow_legacy_send = false;
@@ -1008,6 +1055,39 @@ mod tests {
         let error = recv_json(&mut client.socket).await;
         assert_eq!(error["type"], "error");
         assert_eq!(error["payload"]["code"], "unauthorized");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_replacement_notifies_and_closes_old_connection() {
+        let (addr, server_task) = spawn_test_server(test_config(10)).await;
+
+        let mut client_secret_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut client_secret_bytes);
+
+        let mut original =
+            connect_authenticated_client_with_secret(addr, client_secret_bytes).await;
+        let replacement = connect_authenticated_client_with_secret(addr, client_secret_bytes).await;
+        assert_eq!(original.identity_hash, replacement.identity_hash);
+
+        let replaced = recv_json(&mut original.socket).await;
+        assert_eq!(replaced["type"], "session_replaced");
+
+        let close = original
+            .socket
+            .next()
+            .await
+            .expect("close frame")
+            .expect("close message");
+
+        match close {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, CloseCode::Policy);
+                assert_eq!(frame.reason, "session replaced");
+            }
+            other => panic!("expected close frame, got {other:?}"),
+        }
 
         server_task.abort();
     }
@@ -1350,11 +1430,18 @@ mod tests {
     }
 
     async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
+        let mut client_secret_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut client_secret_bytes);
+        connect_authenticated_client_with_secret(addr, client_secret_bytes).await
+    }
+
+    async fn connect_authenticated_client_with_secret(
+        addr: SocketAddr,
+        client_secret_bytes: [u8; 32],
+    ) -> AuthenticatedClient {
         let url = format!("ws://{addr}/v1/ws");
         let (mut socket, _) = connect_async(url).await.expect("connect websocket");
 
-        let mut client_secret_bytes = [0_u8; 32];
-        rand::rng().fill_bytes(&mut client_secret_bytes);
         let client_secret = StaticSecret::from(client_secret_bytes);
         let client_public = PublicKey::from(&client_secret);
         let client_pubkey_b64 = STANDARD.encode(client_public.as_bytes());
