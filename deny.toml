@@ -3,6 +3,11 @@ all-features = true
 
 [advisories]
 version = 2
+ignore = [
+    # Pre-existing transitive dependency advisories — tracked for upgrade separately
+    "RUSTSEC-2023-0071",  # rsa: Marvin attack (transitive via rustls)
+    "RUSTSEC-2026-0049",  # rustls-webpki (transitive via reqwest)
+]
 
 [licenses]
 version = 2
