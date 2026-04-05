@@ -1066,7 +1066,8 @@ mod tests {
         let mut client_secret_bytes = [0_u8; 32];
         rand::rng().fill_bytes(&mut client_secret_bytes);
 
-        let mut original = connect_authenticated_client_with_secret(addr, client_secret_bytes).await;
+        let mut original =
+            connect_authenticated_client_with_secret(addr, client_secret_bytes).await;
         let replacement = connect_authenticated_client_with_secret(addr, client_secret_bytes).await;
         assert_eq!(original.identity_hash, replacement.identity_hash);
 
