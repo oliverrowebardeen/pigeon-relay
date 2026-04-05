@@ -25,6 +25,7 @@ pub struct CloseDirective {
 }
 
 impl OutboundFrame {
+    #[cfg(test)]
     pub fn fire_and_forget(serialized: String) -> Self {
         Self {
             serialized,
