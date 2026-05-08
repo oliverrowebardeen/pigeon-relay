@@ -75,6 +75,7 @@ impl QueueStore {
         (true, recipient_queue.messages.len())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn messages_for_recipient(&self, recipient_hash: &str) -> Vec<QueuedMessage> {
         let now = Utc::now();
 
@@ -89,6 +90,54 @@ impl QueueStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn take_all_for_recipient(&self, recipient_hash: &str) -> Vec<QueuedMessage> {
+        let now = Utc::now();
+        let Some(mut recipient_queue) = self.queues.get_mut(recipient_hash) else {
+            return Vec::new();
+        };
+
+        recipient_queue
+            .messages
+            .retain(|message| message.expires_at > now);
+        recipient_queue
+            .dedup
+            .retain(|_, expires_at| *expires_at > now);
+
+        let messages = recipient_queue.messages.drain(..).collect();
+        recipient_queue.dedup.clear();
+        messages
+    }
+
+    pub fn requeue_messages(&self, messages: Vec<QueuedMessage>) {
+        let now = Utc::now();
+
+        for message in messages {
+            if message.expires_at <= now {
+                continue;
+            }
+
+            let recipient_hash = message.recipient_hash.clone();
+            let message_id = message.message_id;
+            let expires_at = message.expires_at;
+            let mut recipient_queue = self.queues.entry(recipient_hash).or_default();
+
+            if let Some(existing_expiry) = recipient_queue.dedup.get(&message_id)
+                && *existing_expiry > now
+            {
+                continue;
+            }
+
+            recipient_queue.messages.push_back(message);
+            recipient_queue.dedup.insert(message_id, expires_at);
+
+            while recipient_queue.messages.len() > self.max_queue_per_recipient {
+                if let Some(dropped) = recipient_queue.messages.pop_front() {
+                    recipient_queue.dedup.remove(&dropped.message_id);
+                }
+            }
+        }
     }
 
     pub fn dequeue_message(&self, recipient_hash: &str, message_id: Uuid) -> bool {
@@ -193,5 +242,28 @@ mod tests {
         assert_eq!(queue.depth_for(&recipient), 1);
         assert_eq!(queued[0].message_id, id);
         assert_eq!(queued[0].recipient_hash.as_str(), recipient.as_str());
+    }
+
+    #[test]
+    fn take_all_for_recipient_returns_fifo_messages_and_clears_queue() {
+        let queue = QueueStore::new(Duration::from_secs(3600), 100);
+        let recipient = "abcd".to_string();
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+        for (index, id) in ids.into_iter().enumerate() {
+            let (queued, depth) = queue.enqueue(recipient.clone(), id, format!("blob-{index}"));
+            assert!(queued);
+            assert_eq!(depth, index + 1);
+        }
+
+        let drained = queue.take_all_for_recipient(&recipient);
+        let drained_ids = drained
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(drained_ids, ids);
+        assert_eq!(queue.depth_for(&recipient), 0);
+        assert!(queue.messages_for_recipient(&recipient).is_empty());
     }
 }
