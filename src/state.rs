@@ -195,12 +195,16 @@ impl RelayState {
         true
     }
 
+    pub fn purge_expired_challenges(&self) {
+        let now = Utc::now();
+        self.challenges
+            .retain(|_, challenge| challenge.expires_at > now);
+    }
+
     pub fn purge_expired(&self) {
         let now = Instant::now();
-        let now_chrono = Utc::now();
 
-        self.challenges
-            .retain(|_, challenge| challenge.expires_at > now_chrono);
+        self.purge_expired_challenges();
         self.sessions.retain(|_, session| session.expires_at > now);
         self.rate_limits
             .retain(|_, window| now.duration_since(window.started_at) <= Duration::from_secs(300));

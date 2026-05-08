@@ -108,6 +108,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     });
 
     let mut authenticated_identity: Option<(String, Uuid)> = None;
+    let mut current_challenge_id: Option<String> = None;
     let mut rate_limit_key = format!("anon:{connection_id}");
     let mut connection_role = ConnectionRole::Undecided;
     let mut last_pong = Instant::now();
@@ -164,6 +165,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                             &state,
                             &out_tx,
                             &mut authenticated_identity,
+                            &mut current_challenge_id,
                             &mut rate_limit_key,
                             &mut last_pong,
                             &mut connection_role,
@@ -199,6 +201,9 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     if let Some((identity_hash, token)) = authenticated_identity.take() {
         state.unregister_session(&identity_hash, token);
     }
+    if let Some(challenge_id) = current_challenge_id.take() {
+        state.challenges.remove(&challenge_id);
+    }
 
     drop(out_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
@@ -209,6 +214,7 @@ async fn process_frame(
     state: &Arc<RelayState>,
     out_tx: &mpsc::Sender<OutboundFrame>,
     authenticated_identity: &mut Option<(String, Uuid)>,
+    current_challenge_id: &mut Option<String>,
     rate_limit_key: &mut String,
     last_pong: &mut Instant,
     connection_role: &mut ConnectionRole,
@@ -246,17 +252,6 @@ async fn process_frame(
                 return false;
             }
 
-            if state.challenges.len() >= state.config.max_concurrent_challenges {
-                let _ = send_error(
-                    out_tx,
-                    frame.req_id,
-                    "server_busy",
-                    "too many pending challenges",
-                )
-                .await;
-                return false;
-            }
-
             if authenticated_identity.is_some() {
                 let _ = send_error(
                     out_tx,
@@ -282,6 +277,24 @@ async fn process_frame(
                 }
             };
 
+            if let Some(previous_challenge_id) = current_challenge_id.take() {
+                state.challenges.remove(&previous_challenge_id);
+            }
+
+            if state.challenges.len() >= state.config.max_concurrent_challenges {
+                state.purge_expired_challenges();
+                if state.challenges.len() >= state.config.max_concurrent_challenges {
+                    let _ = send_error(
+                        out_tx,
+                        frame.req_id,
+                        "server_busy",
+                        "too many pending challenges",
+                    )
+                    .await;
+                    return false;
+                }
+            }
+
             let challenge = match auth::create_challenge(
                 &payload.client_pubkey_b64,
                 state.config.challenge_ttl,
@@ -297,9 +310,11 @@ async fn process_frame(
             };
 
             let (challenge_payload, challenge_record) = challenge;
+            let challenge_id = challenge_record.challenge_id.clone();
             state
                 .challenges
-                .insert(challenge_record.challenge_id.clone(), challenge_record);
+                .insert(challenge_id.clone(), challenge_record);
+            *current_challenge_id = Some(challenge_id);
 
             let _ = send_frame(out_tx, "auth_challenge", frame.req_id, challenge_payload).await;
             false
@@ -351,6 +366,9 @@ async fn process_frame(
                 .await;
                 return true;
             };
+            if current_challenge_id.as_deref() == Some(payload.challenge_id.as_str()) {
+                *current_challenge_id = None;
+            }
 
             let identity_hash = match auth::verify_proof(&challenge_record, &payload.proof_b64) {
                 Ok(hash) => hash,
@@ -1136,6 +1154,162 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_hello_replaces_prior_outstanding_challenge() {
+        let (addr, state, server_task) = spawn_test_server_with_state(test_config(10)).await;
+        let client_secret_bytes = random_client_secret_bytes();
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
+        let mut socket = connect_socket(addr).await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64
+                }
+            }),
+        )
+        .await;
+        let first_challenge = recv_json(&mut socket).await;
+        assert_eq!(first_challenge["type"], "auth_challenge");
+        let challenge_id_1 = first_challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("first challenge_id")
+            .to_string();
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(client_secret_bytes)
+                }
+            }),
+        )
+        .await;
+        let second_challenge = recv_json(&mut socket).await;
+        assert_eq!(second_challenge["type"], "auth_challenge");
+        let challenge_id_2 = second_challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("second challenge_id")
+            .to_string();
+
+        assert_ne!(challenge_id_1, challenge_id_2);
+        assert!(state.challenges.get(&challenge_id_1).is_none());
+        assert!(state.challenges.get(&challenge_id_2).is_some());
+        assert_eq!(state.challenges.len(), 1);
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_prove",
+                "payload": build_auth_prove_payload_from_challenge(
+                    &first_challenge["payload"],
+                    client_secret_bytes,
+                )
+            }),
+        )
+        .await;
+
+        let error = recv_json(&mut socket).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["payload"]["code"], "auth_failed");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_challenges_purged_under_cap_pressure() {
+        let mut config = test_config(10);
+        config.max_concurrent_challenges = 2;
+        config.challenge_ttl = Duration::from_secs(1);
+        let (addr, state, server_task) = spawn_test_server_with_state(config).await;
+
+        let mut socket_a = connect_socket(addr).await;
+        let mut socket_b = connect_socket(addr).await;
+
+        for socket in [&mut socket_a, &mut socket_b] {
+            send_json(
+                socket,
+                json!({
+                    "type": "auth_hello",
+                    "payload": {
+                        "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                    }
+                }),
+            )
+            .await;
+            let challenge = recv_json(socket).await;
+            assert_eq!(challenge["type"], "auth_challenge");
+        }
+
+        assert_eq!(state.challenges.len(), 2);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut socket_c = connect_socket(addr).await;
+        send_json(
+            &mut socket_c,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                }
+            }),
+        )
+        .await;
+
+        let challenge = recv_json(&mut socket_c).await;
+        assert_eq!(challenge["type"], "auth_challenge");
+        let challenge_id = challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("challenge_id");
+        assert!(state.challenges.get(challenge_id).is_some());
+        assert_eq!(state.challenges.len(), 1);
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_exit_clears_outstanding_challenge() {
+        let (addr, state, server_task) = spawn_test_server_with_state(test_config(10)).await;
+        let mut socket = connect_socket(addr).await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                }
+            }),
+        )
+        .await;
+
+        let challenge = recv_json(&mut socket).await;
+        assert_eq!(challenge["type"], "auth_challenge");
+        let challenge_id = challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("challenge_id")
+            .to_string();
+        assert!(state.challenges.get(&challenge_id).is_some());
+
+        drop(socket);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.challenges.get(&challenge_id).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("challenge should be cleaned up after socket exit");
+
+        assert!(state.challenges.get(&challenge_id).is_none());
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anonymous_send_connections_rate_limited_per_connection() {
         let (addr, server_task) = spawn_test_server(test_config(2)).await;
 
@@ -1296,6 +1470,7 @@ mod tests {
         let concurrent_message_id = Uuid::new_v4().to_string();
         let concurrent_envelope_b64 = STANDARD.encode(b"concurrent-envelope");
         let mut sender_authenticated_identity = None;
+        let mut sender_current_challenge_id = None;
         let mut sender_rate_limit_key = "anon:sender".to_string();
         let mut sender_last_pong = Instant::now();
         let mut sender_connection_role = ConnectionRole::Undecided;
@@ -1305,6 +1480,7 @@ mod tests {
             &state,
             &sender_out_tx,
             &mut sender_authenticated_identity,
+            &mut sender_current_challenge_id,
             &mut sender_rate_limit_key,
             &mut sender_last_pong,
             &mut sender_connection_role,
@@ -1459,6 +1635,7 @@ mod tests {
         let _ = state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
 
         let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+        let mut current_challenge_id = None;
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1468,6 +1645,7 @@ mod tests {
             &state,
             &out_tx,
             &mut authenticated_identity,
+            &mut current_challenge_id,
             &mut rate_limit_key,
             &mut last_pong,
             &mut connection_role,
@@ -1527,6 +1705,7 @@ mod tests {
         let recipient_hash_for_process = recipient_hash.clone();
         let process_task = tokio::spawn(async move {
             let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+            let mut current_challenge_id = None;
             let mut rate_limit_key = sender_hash;
             let mut last_pong = Instant::now();
             let mut connection_role = ConnectionRole::Receive;
@@ -1536,6 +1715,7 @@ mod tests {
                 &state_for_process,
                 &out_tx_for_process,
                 &mut authenticated_identity,
+                &mut current_challenge_id,
                 &mut rate_limit_key,
                 &mut last_pong,
                 &mut connection_role,
@@ -1706,6 +1886,7 @@ mod tests {
         );
 
         let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+        let mut current_challenge_id = None;
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1716,6 +1897,7 @@ mod tests {
             &state,
             &out_tx,
             &mut authenticated_identity,
+            &mut current_challenge_id,
             &mut rate_limit_key,
             &mut last_pong,
             &mut connection_role,
@@ -1741,23 +1923,36 @@ mod tests {
     }
 
     async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let (addr, _, handle) = spawn_test_server_with_state(config).await;
+        (addr, handle)
+    }
+
+    async fn spawn_test_server_with_state(
+        config: Config,
+    ) -> (SocketAddr, Arc<RelayState>, tokio::task::JoinHandle<()>) {
         let state = Arc::new(RelayState::new(config, None));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("read test server addr");
-        let router = app(state);
+        let router = app(state.clone());
         let handle = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
                 .expect("serve test router");
         });
-        (addr, handle)
+        (addr, state, handle)
+    }
+
+    async fn connect_socket(addr: SocketAddr) -> TestSocket {
+        connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .expect("connect websocket")
+            .0
     }
 
     async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
-        let mut client_secret_bytes = [0_u8; 32];
-        rand::rng().fill_bytes(&mut client_secret_bytes);
+        let client_secret_bytes = random_client_secret_bytes();
         connect_authenticated_client_with_secret(addr, client_secret_bytes).await
     }
 
@@ -1768,7 +1963,7 @@ mod tests {
     ) -> (String, ClientFrame) {
         let client_secret = StaticSecret::from(client_secret_bytes);
         let client_public = PublicKey::from(&client_secret);
-        let client_pubkey_b64 = STANDARD.encode(client_public.as_bytes());
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
         let (challenge_payload, challenge_record) =
             auth::create_challenge(&client_pubkey_b64, state.config.challenge_ttl)
                 .expect("create auth challenge");
@@ -1822,6 +2017,7 @@ mod tests {
         frame: ClientFrame,
     ) -> (bool, Option<(String, Uuid)>) {
         let mut authenticated_identity = None;
+        let mut current_challenge_id = None;
         let mut rate_limit_key = "anon:auth".to_string();
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1831,6 +2027,7 @@ mod tests {
             state,
             out_tx,
             &mut authenticated_identity,
+            &mut current_challenge_id,
             &mut rate_limit_key,
             &mut last_pong,
             &mut connection_role,
@@ -1846,12 +2043,11 @@ mod tests {
         addr: SocketAddr,
         client_secret_bytes: [u8; 32],
     ) -> AuthenticatedClient {
-        let url = format!("ws://{addr}/v1/ws");
-        let (mut socket, _) = connect_async(url).await.expect("connect websocket");
+        let mut socket = connect_socket(addr).await;
 
         let client_secret = StaticSecret::from(client_secret_bytes);
         let client_public = PublicKey::from(&client_secret);
-        let client_pubkey_b64 = STANDARD.encode(client_public.as_bytes());
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
 
         send_json(
             &mut socket,
@@ -1866,46 +2062,15 @@ mod tests {
 
         let challenge = recv_json(&mut socket).await;
         assert_eq!(challenge["type"], "auth_challenge");
-        let payload = &challenge["payload"];
-        let challenge_id = payload["challenge_id"].as_str().expect("challenge_id");
-        let nonce = STANDARD
-            .decode(payload["nonce_b64"].as_str().expect("nonce_b64"))
-            .expect("decode nonce");
-        let server_pubkey_bytes: [u8; 32] = STANDARD
-            .decode(
-                payload["server_pubkey_b64"]
-                    .as_str()
-                    .expect("server_pubkey_b64"),
-            )
-            .expect("decode server pubkey")
-            .try_into()
-            .expect("server pubkey length");
-        let server_public = PublicKey::from(server_pubkey_bytes);
-
-        let shared_secret = client_secret.diffie_hellman(&server_public);
-        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
-        let mut auth_key = [0_u8; 32];
-        let mut info =
-            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
-        info.extend_from_slice(challenge_id.as_bytes());
-        info.extend_from_slice(&nonce);
-        info.extend_from_slice(client_public.as_bytes());
-        hkdf.expand(&info, &mut auth_key).expect("derive auth key");
-
-        let issued_at_ms = payload["issued_at_ms"].as_i64().expect("issued_at_ms");
-        let signed_message = auth::proof_message(challenge_id, issued_at_ms);
-        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
-        mac.update(&signed_message);
-        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
 
         send_json(
             &mut socket,
             json!({
                 "type": "auth_prove",
-                "payload": {
-                    "challenge_id": challenge_id,
-                    "proof_b64": proof_b64
-                }
+                "payload": build_auth_prove_payload_from_challenge(
+                    &challenge["payload"],
+                    client_secret_bytes,
+                )
             }),
         )
         .await;
@@ -1924,6 +2089,65 @@ mod tests {
             socket,
             identity_hash,
         }
+    }
+
+    fn random_client_secret_bytes() -> [u8; 32] {
+        let mut client_secret_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut client_secret_bytes);
+        client_secret_bytes
+    }
+
+    fn client_pubkey_b64_from_secret(client_secret_bytes: [u8; 32]) -> String {
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        STANDARD.encode(client_public.as_bytes())
+    }
+
+    fn build_auth_prove_payload_from_challenge(
+        challenge_payload: &Value,
+        client_secret_bytes: [u8; 32],
+    ) -> Value {
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        let challenge_id = challenge_payload["challenge_id"]
+            .as_str()
+            .expect("challenge_id");
+        let nonce = STANDARD
+            .decode(challenge_payload["nonce_b64"].as_str().expect("nonce_b64"))
+            .expect("decode nonce");
+        let server_pubkey_bytes: [u8; 32] = STANDARD
+            .decode(
+                challenge_payload["server_pubkey_b64"]
+                    .as_str()
+                    .expect("server_pubkey_b64"),
+            )
+            .expect("decode server pubkey")
+            .try_into()
+            .expect("server pubkey length");
+        let server_public = PublicKey::from(server_pubkey_bytes);
+
+        let shared_secret = client_secret.diffie_hellman(&server_public);
+        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
+        let mut auth_key = [0_u8; 32];
+        let mut info =
+            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
+        info.extend_from_slice(challenge_id.as_bytes());
+        info.extend_from_slice(&nonce);
+        info.extend_from_slice(client_public.as_bytes());
+        hkdf.expand(&info, &mut auth_key).expect("derive auth key");
+
+        let issued_at_ms = challenge_payload["issued_at_ms"]
+            .as_i64()
+            .expect("issued_at_ms");
+        let signed_message = auth::proof_message(challenge_id, issued_at_ms);
+        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
+        mac.update(&signed_message);
+        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
+
+        json!({
+            "challenge_id": challenge_id,
+            "proof_b64": proof_b64,
+        })
     }
 
     async fn send_json(socket: &mut TestSocket, value: Value) {
