@@ -16,11 +16,13 @@ The relay never decrypts, inspects, or logs message contents. It stores and forw
      Phone A                             Phone B
      (sender)                           (recipient)
           |                                   |
-          |   1. auth_hello / auth_prove      |
+          |   Receive conns (authenticated)   |
+          |   auth_hello / auth_prove         |
           +----------> [ Relay ] <------------+
           |         (opaque box)              |
           |                                   |
-          |   2. msg_send(envelope_b64)       |
+          |   Anonymous send conn             |
+          |   msg_send(envelope_b64)          |
           +----------> [ Queue ] ------------>+
           |         never decrypted       msg_deliver
           |                                   |
