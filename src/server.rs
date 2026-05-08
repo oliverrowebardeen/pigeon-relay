@@ -287,14 +287,11 @@ async fn process_frame(
                 state.config.challenge_ttl,
             ) {
                 Ok(challenge) => challenge,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "auth_failed",
-                        "invalid client public key",
-                    )
-                    .await;
+                Err(error) => {
+                    debug!(?error, "auth hello failed");
+                    let _ =
+                        send_error(out_tx, frame.req_id, "auth_failed", "authentication failed")
+                            .await;
                     return true;
                 }
             };
@@ -357,14 +354,11 @@ async fn process_frame(
 
             let identity_hash = match auth::verify_proof(&challenge_record, &payload.proof_b64) {
                 Ok(hash) => hash,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "auth_failed",
-                        "proof verification failed",
-                    )
-                    .await;
+                Err(error) => {
+                    debug!(?error, challenge_id = %payload.challenge_id, "auth proof failed");
+                    let _ =
+                        send_error(out_tx, frame.req_id, "auth_failed", "authentication failed")
+                            .await;
                     return true;
                 }
             };
