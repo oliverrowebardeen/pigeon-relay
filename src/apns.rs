@@ -111,7 +111,7 @@ impl ApnsClient {
 
         let http_client = reqwest::Client::builder()
             .build()
-            .map_err(ApnsError::Request)?;
+            .map_err(|error| ApnsError::Request(error.without_url()))?;
 
         Ok(Self {
             http_client,
@@ -159,13 +159,15 @@ impl ApnsClient {
             .json(&payload)
             .send()
             .await
-            .map_err(ApnsError::Request)?;
+            .map_err(|error| ApnsError::Request(error.without_url()))?;
 
         if response.status().is_success() {
             return Ok(());
         }
 
         let status = response.status();
+        // This is the raw APNS response body; unlike reqwest::Error formatting, it does not
+        // append the request URL that carries the device token.
         let body = response
             .text()
             .await
@@ -243,7 +245,7 @@ fn build_message_push_payload() -> MessagePushPayload {
 mod tests {
     use serde_json::json;
 
-    use super::build_message_push_payload;
+    use super::{ApnsError, build_message_push_payload};
 
     #[test]
     fn serializes_message_push_payload_as_silent_background_push() {
@@ -258,6 +260,33 @@ mod tests {
                 },
                 "pigeon_type": "relay_message"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn request_error_strips_url_with_device_token() {
+        let device_token_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let url = format!("http://127.0.0.1:1/3/device/{device_token_hex}");
+
+        let raw = reqwest::Client::new()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("connection to a closed port should fail");
+
+        assert!(
+            format!("{raw:?}").contains(device_token_hex),
+            "sanity check: an unscrubbed reqwest::Error normally formats with its URL"
+        );
+
+        let scrubbed = ApnsError::Request(raw.without_url());
+        assert!(
+            !format!("{scrubbed:?}").contains(device_token_hex),
+            "scrubbed Debug leaked the device token: {scrubbed:?}"
+        );
+        assert!(
+            !scrubbed.to_string().contains(device_token_hex),
+            "scrubbed Display leaked the device token: {scrubbed}"
         );
     }
 }
