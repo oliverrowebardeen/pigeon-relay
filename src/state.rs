@@ -68,13 +68,25 @@ pub struct SessionHandle {
     pub expires_at: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PushRegistration {
     pub device_token_hex: String,
     pub apns_env: ApnsEnvironment,
     pub topic_override: Option<String>,
     pub last_push_at: Option<Instant>,
     pub registered_at: Instant,
+}
+
+impl std::fmt::Debug for PushRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushRegistration")
+            .field("device_token_hex", &"<redacted>")
+            .field("apns_env", &self.apns_env)
+            .field("topic_override", &self.topic_override)
+            .field("last_push_at", &self.last_push_at)
+            .field("registered_at", &self.registered_at)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -190,5 +202,30 @@ impl RelayState {
             .retain(|_, reg| now.duration_since(reg.registered_at) <= self.config.push_token_ttl);
 
         self.queue.purge_expired();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_registration_debug_redacts_device_token() {
+        let token = "deadbeef".repeat(8);
+        let registration = PushRegistration {
+            device_token_hex: token.clone(),
+            apns_env: ApnsEnvironment::Sandbox,
+            topic_override: Some("com.example.pigeon".to_string()),
+            last_push_at: None,
+            registered_at: Instant::now(),
+        };
+
+        let formatted = format!("{registration:?}");
+        assert!(
+            !formatted.contains(&token),
+            "device token leaked into Debug output: {formatted}"
+        );
+        assert!(formatted.contains("<redacted>"));
+        assert!(formatted.contains("Sandbox"));
     }
 }

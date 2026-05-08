@@ -18,7 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const HKDF_SALT: &[u8] = b"pigeon-relay-auth-v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChallengeRecord {
     pub challenge_id: String,
     pub client_pubkey: [u8; 32],
@@ -26,6 +26,19 @@ pub struct ChallengeRecord {
     pub nonce: Vec<u8>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ChallengeRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChallengeRecord")
+            .field("challenge_id", &self.challenge_id)
+            .field("client_pubkey", &"<redacted>")
+            .field("server_secret", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -231,6 +244,29 @@ mod tests {
             result,
             Err(AuthError::NonContributoryClientPublicKey)
         ));
+    }
+
+    #[test]
+    fn challenge_record_debug_redacts_secrets() {
+        let server_secret = [0xAB_u8; 32];
+        let client_pubkey = [0xCD_u8; 32];
+        let nonce = vec![0xEF_u8; 16];
+        let now = Utc::now();
+        let record = ChallengeRecord {
+            challenge_id: "challenge-1".to_string(),
+            client_pubkey,
+            server_secret,
+            nonce: nonce.clone(),
+            issued_at: now,
+            expires_at: now + chrono::Duration::seconds(30),
+        };
+
+        let formatted = format!("{record:?}");
+        assert!(!formatted.contains("ab, ab"));
+        assert!(!formatted.contains("cd, cd"));
+        assert!(!formatted.contains("ef, ef"));
+        assert!(formatted.contains("<redacted>"));
+        assert!(formatted.contains("challenge-1"));
     }
 
     fn build_proof(record: &ChallengeRecord) -> String {
