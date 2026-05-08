@@ -107,7 +107,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
         }
     });
 
-    let mut authenticated_identity: Option<String> = None;
+    let mut authenticated_identity: Option<(String, Uuid)> = None;
     let mut rate_limit_key = format!("anon:{connection_id}");
     let mut connection_role = ConnectionRole::Undecided;
     let mut last_pong = Instant::now();
@@ -196,8 +196,8 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
         }
     }
 
-    if let Some(identity_hash) = authenticated_identity.as_deref() {
-        state.unregister_session(identity_hash);
+    if let Some((identity_hash, token)) = authenticated_identity.take() {
+        state.unregister_session(&identity_hash, token);
     }
 
     drop(out_tx);
@@ -208,7 +208,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
 async fn process_frame(
     state: &Arc<RelayState>,
     out_tx: &mpsc::Sender<OutboundFrame>,
-    authenticated_identity: &mut Option<String>,
+    authenticated_identity: &mut Option<(String, Uuid)>,
     rate_limit_key: &mut String,
     last_pong: &mut Instant,
     connection_role: &mut ConnectionRole,
@@ -368,7 +368,7 @@ async fn process_frame(
                 + ChronoDuration::from_std(state.config.session_ttl)
                     .expect("validated session_ttl should fit chrono::Duration");
 
-            state.register_session(
+            let session_token = state.register_session(
                 identity_hash.clone(),
                 out_tx.clone(),
                 state.config.session_ttl,
@@ -386,7 +386,7 @@ async fn process_frame(
             .await
             .is_err()
             {
-                state.unregister_session(&identity_hash);
+                state.unregister_session(&identity_hash, session_token);
                 return true;
             }
 
@@ -394,12 +394,12 @@ async fn process_frame(
                 .await
                 .is_err()
             {
-                state.unregister_session(&identity_hash);
+                state.unregister_session(&identity_hash, session_token);
                 return true;
             }
 
             *rate_limit_key = identity_hash.clone();
-            *authenticated_identity = Some(identity_hash);
+            *authenticated_identity = Some((identity_hash, session_token));
 
             false
         }
@@ -501,12 +501,15 @@ async fn process_frame(
             };
             let _ = send_frame(out_tx, "msg_accepted", frame.req_id, accepted_payload).await;
 
-            let recipient_sender = state
-                .sessions
-                .get(&payload.recipient_hash_hex)
-                .map(|recipient_session| recipient_session.sender.clone());
+            let recipient_session =
+                state
+                    .sessions
+                    .get(&payload.recipient_hash_hex)
+                    .map(|recipient_session| {
+                        (recipient_session.sender.clone(), recipient_session.token)
+                    });
 
-            if let Some(recipient_sender) = recipient_sender {
+            if let Some((recipient_sender, recipient_token)) = recipient_session {
                 let deliver_payload = MessageDeliverPayload {
                     message_id: payload.message_id,
                     envelope_b64: payload.envelope_b64,
@@ -520,7 +523,7 @@ async fn process_frame(
                         .queue
                         .dequeue_message(&payload.recipient_hash_hex, message_id);
                 } else {
-                    state.unregister_session(&payload.recipient_hash_hex);
+                    state.unregister_session(&payload.recipient_hash_hex, recipient_token);
                     warn!(
                         recipient = %hash_prefix(&payload.recipient_hash_hex),
                         "live delivery failed for stale session; falling back to APNS"
@@ -556,7 +559,7 @@ async fn process_frame(
                 return false;
             }
 
-            let Some(identity_hash) = authenticated_identity.as_ref() else {
+            let Some((identity_hash, _)) = authenticated_identity.as_ref() else {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -1213,9 +1216,9 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel::<OutboundFrame>(1);
         drop(dead_rx);
 
-        state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
+        let _ = state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
 
-        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1250,6 +1253,94 @@ mod tests {
         assert_eq!(accepted["type"], "msg_accepted");
 
         let queued = state.queue.messages_for_recipient(&"b".repeat(64));
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_delivery_failure_only_evicts_stale_session() {
+        let recipient_hash = "b".repeat(64);
+        let sender_hash = "a".repeat(64);
+
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let mut delivered_frames = spawn_confirming_writer(out_rx);
+        let (stale_tx, mut stale_rx) = mpsc::channel::<OutboundFrame>(1);
+        let (replacement_tx, _replacement_rx) = mpsc::channel::<OutboundFrame>(1);
+        let (deliver_seen_tx, deliver_seen_rx) = tokio::sync::oneshot::channel();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+
+        let stale_token =
+            state.register_session(recipient_hash.clone(), stale_tx, Duration::from_secs(60));
+
+        tokio::spawn(async move {
+            let outbound = stale_rx.recv().await.expect("stale outbound frame");
+            assert!(outbound.serialized.contains("\"msg_deliver\""));
+            let _ = deliver_seen_tx.send(());
+            let _ = fail_rx.await;
+            if let Some(delivery_tx) = outbound.delivery_tx {
+                let _ = delivery_tx.send(Err(()));
+            }
+        });
+
+        let state_for_process = state.clone();
+        let out_tx_for_process = out_tx.clone();
+        let recipient_hash_for_process = recipient_hash.clone();
+        let process_task = tokio::spawn(async move {
+            let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+            let mut rate_limit_key = sender_hash;
+            let mut last_pong = Instant::now();
+            let mut connection_role = ConnectionRole::Receive;
+            let allow_legacy_send = true;
+
+            process_frame(
+                &state_for_process,
+                &out_tx_for_process,
+                &mut authenticated_identity,
+                &mut rate_limit_key,
+                &mut last_pong,
+                &mut connection_role,
+                &allow_legacy_send,
+                ClientFrame {
+                    frame_type: "msg_send".to_string(),
+                    req_id: Some("req-race".to_string()),
+                    payload: serde_json::json!({
+                        "message_id": Uuid::new_v4().to_string(),
+                        "recipient_hash_hex": recipient_hash_for_process,
+                        "envelope_b64": STANDARD.encode(b"opaque-envelope"),
+                    }),
+                },
+            )
+            .await
+        });
+
+        deliver_seen_rx
+            .await
+            .expect("stale live delivery should be attempted");
+
+        let replacement_token = state.register_session(
+            recipient_hash.clone(),
+            replacement_tx,
+            Duration::from_secs(60),
+        );
+
+        let _ = fail_tx.send(());
+
+        let should_close = process_task.await.expect("process_frame task");
+        assert!(!should_close);
+
+        let session = state
+            .sessions
+            .get(&recipient_hash)
+            .expect("replacement session should remain registered");
+        assert_eq!(session.token, replacement_token);
+        assert_ne!(session.token, stale_token);
+
+        let accepted = delivered_frames.recv().await.expect("msg_accepted");
+        let accepted: serde_json::Value =
+            serde_json::from_str(&accepted).expect("parse msg_accepted");
+        assert_eq!(accepted["type"], "msg_accepted");
+
+        let queued = state.queue.messages_for_recipient(&recipient_hash);
         assert_eq!(queued.len(), 1);
     }
 
@@ -1368,13 +1459,13 @@ mod tests {
             ))
             .expect("fill recipient outbound queue");
 
-        state.register_session(
+        let _ = state.register_session(
             recipient_hash.clone(),
             recipient_tx,
             Duration::from_secs(60),
         );
 
-        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
