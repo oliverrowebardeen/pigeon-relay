@@ -370,8 +370,9 @@ async fn process_frame(
             };
 
             let session_expires_at = Utc::now()
+                // Config::from_env rejects session_ttl values that chrono cannot represent.
                 + ChronoDuration::from_std(state.config.session_ttl)
-                    .unwrap_or(ChronoDuration::hours(24));
+                    .expect("validated session_ttl should fit chrono::Duration");
 
             state.register_session(
                 identity_hash.clone(),
