@@ -1,6 +1,6 @@
 # pigeon-relay
 
-An opaque, zero-knowledge WebSocket relay server for [Pigeon](https://github.com/oliverrowebardeen/pigeon-ios) -- an end-to-end encrypted messenger that communicates over BLE mesh, internet relay, or both.
+A WebSocket relay server for opaque encrypted envelopes for [Pigeon](https://github.com/oliverrowebardeen/pigeon-ios) -- an end-to-end encrypted messenger that communicates over BLE mesh, internet relay, or both.
 
 The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
 
@@ -43,13 +43,13 @@ Every message between clients is encrypted end-to-end with AES-256-GCM before it
 
 ## Key Design Decisions
 
-**Zero-knowledge relay.** The server cannot read messages. Send connections are anonymous -- the relay processes `msg_send` without knowing or asking for sender identity. Receive connections are authenticated for message delivery. The relay cannot link the two at the protocol level, preventing sender-recipient correlation.
+**Opaque message transport.** The server cannot decrypt client-encrypted message content. `msg_send` does not require sender authentication, while receive connections prove the recipient identity. Network addresses, timing, sizes, and recipient routing hashes remain visible, so separate sockets do not guarantee anonymity or prevent correlation.
 
 **Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
 
 **Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
 
-**Sealed sender.** Message sending is fully anonymous. Send connections carry no authentication -- the relay has no sender identity in the send path. Receive connections are authenticated solely for delivery routing. `msg_deliver` contains only the encrypted envelope, message ID, and timestamp. The relay cannot build a social graph because it architecturally cannot identify who is sending.
+**Sealed sender.** The send protocol omits the sender identity. Receive connections are authenticated solely for delivery routing. `msg_deliver` contains the encrypted envelope, message ID, and timestamp. This reduces exposed protocol metadata; it does not stop a relay operator or network observer from correlating traffic.
 
 **Bridge-transparent.** A bridge phone that relays traffic for nearby BLE-only peers doesn't need special server-side logic. Each tunneled peer authenticates as itself over its own WebSocket session. Multiple identities behind the same NAT/IP are expected and rate-limited independently.
 
@@ -106,7 +106,7 @@ All frames are JSON with a `type` field:
 ## Building from Source
 
 **Prerequisites:**
-- Rust 1.85+ (this project uses edition 2024)
+- Rust 1.88+ (this project uses edition 2024)
 - Git
 
 ```bash
@@ -219,7 +219,7 @@ The queue is not persisted to disk. A server restart clears all queued messages.
 ## Testing
 
 ```bash
-cargo test --all-targets --all-features
+cargo test --all-targets --all-features --locked
 ```
 
 Tests include integration tests that stand up a real WebSocket server and perform full ECDH authentication handshakes.
@@ -229,7 +229,7 @@ Tests include integration tests that stand up a real WebSocket server and perfor
 CI runs on every push and pull request:
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features`
+- `cargo test --all-targets --all-features --locked`
 - `cargo deny check advisories bans licenses sources`
 - `gitleaks`
 
@@ -268,3 +268,9 @@ The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to lo
 ## License
 
 [MIT](LICENSE)
+
+## Security and deployment limits
+
+See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
+
+CI uses the committed lockfile, checks the minimum Rust version, denies dependency advisories/warnings, and scans full Git history. APNS requests and socket delivery confirmations have bounded waits. `jsonwebtoken` uses the AWS-LC backend to avoid the unused RSA dependency previously present in the default RustCrypto backend.

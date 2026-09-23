@@ -1,6 +1,6 @@
 # Security Policy
 
-`pigeon-relay` is a zero-knowledge relay for an end-to-end encrypted messenger. Cryptographic and protocol-level vulnerabilities are taken seriously and handled privately.
+`pigeon-relay` forwards opaque encrypted envelopes for an end-to-end encrypted messenger. Cryptographic and protocol-level vulnerabilities are taken seriously and handled privately.
 
 ## Reporting a Vulnerability
 
@@ -32,7 +32,7 @@ There is no monetary bug bounty. Reporters who prefer attribution are credited i
 **In scope:**
 
 - Anything in this repository: the relay binary, its protocol, dependencies pinned in `Cargo.lock`, CI configuration.
-- Cryptographic claims made in `README.md` (zero-knowledge relay, sealed sender, accountless ECDH challenge-response, constant-time verification).
+- Cryptographic claims made in `README.md` (opaque envelope forwarding, sealed sender, accountless ECDH challenge-response, constant-time verification).
 - Issues that allow sender↔recipient correlation, identity recovery, message-content recovery, or unauthorized message delivery.
 - Resource exhaustion that is not bounded by the configured caps.
 
@@ -51,7 +51,7 @@ There is no monetary bug bounty. Reporters who prefer attribution are credited i
 
 ## Threat Model Summary
 
-The relay is designed under the assumption that the operator and the server itself are **untrusted by clients**. Clients do not rely on the relay for confidentiality, authenticity, or sender privacy beyond what the protocol enforces. The relay sees only opaque blobs and identity hashes; any vulnerability that lets the relay learn more than that is in scope.
+The relay is designed under the assumption that the operator and the server itself are **untrusted by clients**. Clients do not rely on the relay for confidentiality, authenticity, or sender privacy beyond what the protocol enforces. The relay sees ciphertext, recipient identity hashes, source network addresses, connection timing, and message sizes. Send sockets omit authenticated sender identity, but traffic analysis can still correlate send and receive connections. Content disclosure or violations of the documented authentication boundary are in scope.
 
 The relay does **not** defend against:
 

@@ -110,6 +110,8 @@ impl ApnsClient {
         )?;
 
         let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|error| ApnsError::Request(error.without_url()))?;
 

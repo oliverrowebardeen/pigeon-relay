@@ -40,13 +40,14 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = app(state.clone());
 
-    tokio::spawn(purge_loop(state.clone()));
-
     let listener = TcpListener::bind(&state.config.relay_addr).await?;
+    let purge_task = tokio::spawn(purge_loop(state.clone()));
     info!(addr = %state.config.relay_addr, "relay server listening");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    purge_task.abort();
+    result?;
     Ok(())
 }
 
@@ -80,7 +81,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(state.config.max_session_send_queue);
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
             let close_after_send = outbound.close_after_send;
             let send_result = ws_sender
@@ -206,7 +207,13 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     }
 
     drop(out_tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    if tokio::time::timeout(Duration::from_secs(5), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -776,8 +783,9 @@ where
         tokio::sync::mpsc::error::TrySendError::Full(_) => SendFrameError::QueueFull,
         tokio::sync::mpsc::error::TrySendError::Closed(_) => SendFrameError::QueueClosed,
     })?;
-    delivery_rx
+    tokio::time::timeout(Duration::from_secs(5), delivery_rx)
         .await
+        .map_err(|_| SendFrameError::DeliveryFailed)?
         .map_err(|_| SendFrameError::DeliveryFailed)?
         .map_err(|_| SendFrameError::DeliveryFailed)
 }
@@ -1942,6 +1950,22 @@ mod tests {
                 .expect("serve test router");
         });
         (addr, state, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_writer_cannot_block_frame_delivery_forever() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let send = tokio::spawn(async move {
+            super::send_frame(&tx, "pong", None, crate::protocol::EmptyPayload {}).await
+        });
+        // Retain the confirmation sender, emulating a socket stalled in write().
+        let held_frame = rx.recv().await.expect("queued frame");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(
+            send.await.unwrap(),
+            Err(super::SendFrameError::DeliveryFailed)
+        );
+        drop(held_frame);
     }
 
     async fn connect_socket(addr: SocketAddr) -> TestSocket {

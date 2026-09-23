@@ -1,0 +1,8 @@
+title = "Pigeon relay secret scanning"
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic APNS token used only by the URL-redaction regression test"
+regexTarget = "secret"
+regexes = ['^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$']
