@@ -18,7 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const HKDF_SALT: &[u8] = b"pigeon-relay-auth-v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChallengeRecord {
     pub challenge_id: String,
     pub client_pubkey: [u8; 32],
@@ -28,10 +28,25 @@ pub struct ChallengeRecord {
     pub expires_at: DateTime<Utc>,
 }
 
+impl std::fmt::Debug for ChallengeRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChallengeRecord")
+            .field("challenge_id", &self.challenge_id)
+            .field("client_pubkey", &"<redacted>")
+            .field("server_secret", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("invalid client public key")]
     InvalidClientPublicKey,
+    #[error("non-contributory client public key")]
+    NonContributoryClientPublicKey,
     #[error("invalid base64 payload")]
     InvalidBase64,
     #[error("invalid challenge")]
@@ -59,7 +74,13 @@ pub fn create_challenge(
     let mut secret_bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut secret_bytes);
     let server_secret = StaticSecret::from(secret_bytes);
+    let client_public = PublicKey::from(client_pubkey);
+    let shared_secret = server_secret.diffie_hellman(&client_public);
     let server_pubkey = PublicKey::from(&server_secret);
+
+    if !shared_secret.was_contributory() {
+        return Err(AuthError::NonContributoryClientPublicKey);
+    }
 
     let mut nonce = [0_u8; 16];
     rand::rng().fill_bytes(&mut nonce);
@@ -101,6 +122,7 @@ pub fn verify_proof(record: &ChallengeRecord, proof_b64: &str) -> Result<String,
     let client_public = PublicKey::from(record.client_pubkey);
     let server_secret = StaticSecret::from(record.server_secret);
     let shared_secret = server_secret.diffie_hellman(&client_public);
+    let is_contributory = shared_secret.was_contributory();
 
     let mut auth_key = [0_u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret.as_bytes());
@@ -120,7 +142,15 @@ pub fn verify_proof(record: &ChallengeRecord, proof_b64: &str) -> Result<String,
     mac.update(&signed_message);
     let expected = mac.finalize().into_bytes();
 
-    if expected.ct_eq(&proof).unwrap_u8() != 1 {
+    let proof_matches = expected.ct_eq(&proof).unwrap_u8() == 1;
+
+    // Keep the low-order failure path close to InvalidProof timing by finishing
+    // the same key-derivation and MAC work before returning.
+    if !is_contributory {
+        return Err(AuthError::NonContributoryClientPublicKey);
+    }
+
+    if !proof_matches {
         return Err(AuthError::InvalidProof);
     }
 
@@ -183,6 +213,60 @@ mod tests {
 
         let result = verify_proof(&challenge_record, &tampered);
         assert!(matches!(result, Err(AuthError::InvalidProof)));
+    }
+
+    #[test]
+    fn low_order_client_public_key_is_rejected() {
+        let low_order_pubkey = [0_u8; 32];
+
+        let challenge =
+            create_challenge(&STANDARD.encode(low_order_pubkey), Duration::from_secs(30));
+        assert!(matches!(
+            challenge,
+            Err(AuthError::NonContributoryClientPublicKey)
+        ));
+
+        let mut server_secret = [0_u8; 32];
+        rand::rng().fill_bytes(&mut server_secret);
+        let now = Utc::now();
+        let record = ChallengeRecord {
+            challenge_id: Uuid::new_v4().to_string(),
+            client_pubkey: low_order_pubkey,
+            server_secret,
+            nonce: vec![0_u8; 16],
+            issued_at: now,
+            expires_at: now + chrono::Duration::seconds(30),
+        };
+
+        let proof = STANDARD.encode([0_u8; 32]);
+        let result = verify_proof(&record, &proof);
+        assert!(matches!(
+            result,
+            Err(AuthError::NonContributoryClientPublicKey)
+        ));
+    }
+
+    #[test]
+    fn challenge_record_debug_redacts_secrets() {
+        let server_secret = [0xAB_u8; 32];
+        let client_pubkey = [0xCD_u8; 32];
+        let nonce = vec![0xEF_u8; 16];
+        let now = Utc::now();
+        let record = ChallengeRecord {
+            challenge_id: "challenge-1".to_string(),
+            client_pubkey,
+            server_secret,
+            nonce: nonce.clone(),
+            issued_at: now,
+            expires_at: now + chrono::Duration::seconds(30),
+        };
+
+        let formatted = format!("{record:?}");
+        assert!(!formatted.contains("ab, ab"));
+        assert!(!formatted.contains("cd, cd"));
+        assert!(!formatted.contains("ef, ef"));
+        assert!(formatted.contains("<redacted>"));
+        assert!(formatted.contains("challenge-1"));
     }
 
     fn build_proof(record: &ChallengeRecord) -> String {

@@ -40,13 +40,14 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = app(state.clone());
 
-    tokio::spawn(purge_loop(state.clone()));
-
     let listener = TcpListener::bind(&state.config.relay_addr).await?;
+    let purge_task = tokio::spawn(purge_loop(state.clone()));
     info!(addr = %state.config.relay_addr, "relay server listening");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    purge_task.abort();
+    result?;
     Ok(())
 }
 
@@ -65,8 +66,20 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
+    let Ok(permit) = state.connection_slots.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay connection capacity reached",
+        )
+            .into_response();
+    };
     ws.max_message_size(max_ws_frame_size(state.config.max_message_bytes))
-        .on_upgrade(move |socket| handle_socket(state, socket))
+        .on_upgrade(move |socket| async move {
+            // Held across the entire connection; also released if upgrade fails.
+            let _permit = permit;
+            handle_socket(state, socket).await;
+        })
+        .into_response()
 }
 
 fn max_ws_frame_size(max_message_bytes: usize) -> usize {
@@ -80,7 +93,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(state.config.max_session_send_queue);
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
             let close_after_send = outbound.close_after_send;
             let send_result = ws_sender
@@ -107,7 +120,8 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
         }
     });
 
-    let mut authenticated_identity: Option<String> = None;
+    let mut authenticated_identity: Option<(String, Uuid)> = None;
+    let mut current_challenge_id: Option<String> = None;
     let mut rate_limit_key = format!("anon:{connection_id}");
     let mut connection_role = ConnectionRole::Undecided;
     let mut last_pong = Instant::now();
@@ -164,6 +178,7 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
                             &state,
                             &out_tx,
                             &mut authenticated_identity,
+                            &mut current_challenge_id,
                             &mut rate_limit_key,
                             &mut last_pong,
                             &mut connection_role,
@@ -196,19 +211,29 @@ async fn handle_socket(state: Arc<RelayState>, socket: WebSocket) {
         }
     }
 
-    if let Some(identity_hash) = authenticated_identity.as_deref() {
-        state.unregister_session(identity_hash);
+    if let Some((identity_hash, token)) = authenticated_identity.take() {
+        state.unregister_session(&identity_hash, token);
+    }
+    if let Some(challenge_id) = current_challenge_id.take() {
+        state.challenges.remove(&challenge_id);
     }
 
     drop(out_tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    if tokio::time::timeout(Duration::from_secs(5), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn process_frame(
     state: &Arc<RelayState>,
     out_tx: &mpsc::Sender<OutboundFrame>,
-    authenticated_identity: &mut Option<String>,
+    authenticated_identity: &mut Option<(String, Uuid)>,
+    current_challenge_id: &mut Option<String>,
     rate_limit_key: &mut String,
     last_pong: &mut Instant,
     connection_role: &mut ConnectionRole,
@@ -246,17 +271,6 @@ async fn process_frame(
                 return false;
             }
 
-            if state.challenges.len() >= state.config.max_concurrent_challenges {
-                let _ = send_error(
-                    out_tx,
-                    frame.req_id,
-                    "server_busy",
-                    "too many pending challenges",
-                )
-                .await;
-                return false;
-            }
-
             if authenticated_identity.is_some() {
                 let _ = send_error(
                     out_tx,
@@ -282,27 +296,44 @@ async fn process_frame(
                 }
             };
 
+            if let Some(previous_challenge_id) = current_challenge_id.take() {
+                state.challenges.remove(&previous_challenge_id);
+            }
+
+            if state.challenges.len() >= state.config.max_concurrent_challenges {
+                state.purge_expired_challenges();
+                if state.challenges.len() >= state.config.max_concurrent_challenges {
+                    let _ = send_error(
+                        out_tx,
+                        frame.req_id,
+                        "server_busy",
+                        "too many pending challenges",
+                    )
+                    .await;
+                    return false;
+                }
+            }
+
             let challenge = match auth::create_challenge(
                 &payload.client_pubkey_b64,
                 state.config.challenge_ttl,
             ) {
                 Ok(challenge) => challenge,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "auth_failed",
-                        "invalid client public key",
-                    )
-                    .await;
+                Err(error) => {
+                    debug!(?error, "auth hello failed");
+                    let _ =
+                        send_error(out_tx, frame.req_id, "auth_failed", "authentication failed")
+                            .await;
                     return true;
                 }
             };
 
             let (challenge_payload, challenge_record) = challenge;
+            let challenge_id = challenge_record.challenge_id.clone();
             state
                 .challenges
-                .insert(challenge_record.challenge_id.clone(), challenge_record);
+                .insert(challenge_id.clone(), challenge_record);
+            *current_challenge_id = Some(challenge_id);
 
             let _ = send_frame(out_tx, "auth_challenge", frame.req_id, challenge_payload).await;
             false
@@ -354,30 +385,25 @@ async fn process_frame(
                 .await;
                 return true;
             };
+            if current_challenge_id.as_deref() == Some(payload.challenge_id.as_str()) {
+                *current_challenge_id = None;
+            }
 
             let identity_hash = match auth::verify_proof(&challenge_record, &payload.proof_b64) {
                 Ok(hash) => hash,
-                Err(_) => {
-                    let _ = send_error(
-                        out_tx,
-                        frame.req_id,
-                        "auth_failed",
-                        "proof verification failed",
-                    )
-                    .await;
+                Err(error) => {
+                    debug!(?error, challenge_id = %payload.challenge_id, "auth proof failed");
+                    let _ =
+                        send_error(out_tx, frame.req_id, "auth_failed", "authentication failed")
+                            .await;
                     return true;
                 }
             };
 
             let session_expires_at = Utc::now()
+                // Config::from_env rejects session_ttl values that chrono cannot represent.
                 + ChronoDuration::from_std(state.config.session_ttl)
-                    .unwrap_or(ChronoDuration::hours(24));
-
-            state.register_session(
-                identity_hash.clone(),
-                out_tx.clone(),
-                state.config.session_ttl,
-            );
+                    .expect("validated session_ttl should fit chrono::Duration");
 
             if send_frame(
                 out_tx,
@@ -391,7 +417,6 @@ async fn process_frame(
             .await
             .is_err()
             {
-                state.unregister_session(&identity_hash);
                 return true;
             }
 
@@ -399,12 +424,17 @@ async fn process_frame(
                 .await
                 .is_err()
             {
-                state.unregister_session(&identity_hash);
                 return true;
             }
 
+            let session_token = state.register_session(
+                identity_hash.clone(),
+                out_tx.clone(),
+                state.config.session_ttl,
+            );
+
             *rate_limit_key = identity_hash.clone();
-            *authenticated_identity = Some(identity_hash);
+            *authenticated_identity = Some((identity_hash, session_token));
 
             false
         }
@@ -506,12 +536,15 @@ async fn process_frame(
             };
             let _ = send_frame(out_tx, "msg_accepted", frame.req_id, accepted_payload).await;
 
-            let recipient_sender = state
-                .sessions
-                .get(&payload.recipient_hash_hex)
-                .map(|recipient_session| recipient_session.sender.clone());
+            let recipient_session =
+                state
+                    .sessions
+                    .get(&payload.recipient_hash_hex)
+                    .map(|recipient_session| {
+                        (recipient_session.sender.clone(), recipient_session.token)
+                    });
 
-            if let Some(recipient_sender) = recipient_sender {
+            if let Some((recipient_sender, recipient_token)) = recipient_session {
                 let deliver_payload = MessageDeliverPayload {
                     message_id: payload.message_id,
                     envelope_b64: payload.envelope_b64,
@@ -525,7 +558,7 @@ async fn process_frame(
                         .queue
                         .dequeue_message(&payload.recipient_hash_hex, message_id);
                 } else {
-                    state.unregister_session(&payload.recipient_hash_hex);
+                    state.unregister_session(&payload.recipient_hash_hex, recipient_token);
                     warn!(
                         recipient = %hash_prefix(&payload.recipient_hash_hex),
                         "live delivery failed for stale session; falling back to APNS"
@@ -561,7 +594,7 @@ async fn process_frame(
                 return false;
             }
 
-            let Some(identity_hash) = authenticated_identity.as_ref() else {
+            let Some((identity_hash, _)) = authenticated_identity.as_ref() else {
                 let _ = send_error(
                     out_tx,
                     frame.req_id,
@@ -716,16 +749,23 @@ async fn deliver_queued_messages(
     recipient_hash: &str,
     sender: &mpsc::Sender<OutboundFrame>,
 ) -> Result<(), SendFrameError> {
-    for queued in state.queue.messages_for_recipient(recipient_hash) {
+    let mut queued_messages = state
+        .queue
+        .take_all_for_recipient(recipient_hash)
+        .into_iter();
+
+    while let Some(queued) = queued_messages.next() {
         let payload = MessageDeliverPayload {
             message_id: queued.message_id.to_string(),
-            envelope_b64: queued.envelope_b64,
+            envelope_b64: queued.envelope_b64.clone(),
             queued_at_ms: queued.queued_at.timestamp_millis(),
         };
-        send_frame(sender, "msg_deliver", None, payload).await?;
-        state
-            .queue
-            .dequeue_message(recipient_hash, queued.message_id);
+        if let Err(error) = send_frame(sender, "msg_deliver", None, payload).await {
+            let mut undelivered = vec![queued];
+            undelivered.extend(queued_messages);
+            state.queue.requeue_messages(undelivered);
+            return Err(error);
+        }
     }
 
     Ok(())
@@ -755,8 +795,9 @@ where
         tokio::sync::mpsc::error::TrySendError::Full(_) => SendFrameError::QueueFull,
         tokio::sync::mpsc::error::TrySendError::Closed(_) => SendFrameError::QueueClosed,
     })?;
-    delivery_rx
+    tokio::time::timeout(Duration::from_secs(5), delivery_rx)
         .await
+        .map_err(|_| SendFrameError::DeliveryFailed)?
         .map_err(|_| SendFrameError::DeliveryFailed)?
         .map_err(|_| SendFrameError::DeliveryFailed)
 }
@@ -1133,6 +1174,162 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_hello_replaces_prior_outstanding_challenge() {
+        let (addr, state, server_task) = spawn_test_server_with_state(test_config(10)).await;
+        let client_secret_bytes = random_client_secret_bytes();
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
+        let mut socket = connect_socket(addr).await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64
+                }
+            }),
+        )
+        .await;
+        let first_challenge = recv_json(&mut socket).await;
+        assert_eq!(first_challenge["type"], "auth_challenge");
+        let challenge_id_1 = first_challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("first challenge_id")
+            .to_string();
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(client_secret_bytes)
+                }
+            }),
+        )
+        .await;
+        let second_challenge = recv_json(&mut socket).await;
+        assert_eq!(second_challenge["type"], "auth_challenge");
+        let challenge_id_2 = second_challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("second challenge_id")
+            .to_string();
+
+        assert_ne!(challenge_id_1, challenge_id_2);
+        assert!(state.challenges.get(&challenge_id_1).is_none());
+        assert!(state.challenges.get(&challenge_id_2).is_some());
+        assert_eq!(state.challenges.len(), 1);
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_prove",
+                "payload": build_auth_prove_payload_from_challenge(
+                    &first_challenge["payload"],
+                    client_secret_bytes,
+                )
+            }),
+        )
+        .await;
+
+        let error = recv_json(&mut socket).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["payload"]["code"], "auth_failed");
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_challenges_purged_under_cap_pressure() {
+        let mut config = test_config(10);
+        config.max_concurrent_challenges = 2;
+        config.challenge_ttl = Duration::from_secs(1);
+        let (addr, state, server_task) = spawn_test_server_with_state(config).await;
+
+        let mut socket_a = connect_socket(addr).await;
+        let mut socket_b = connect_socket(addr).await;
+
+        for socket in [&mut socket_a, &mut socket_b] {
+            send_json(
+                socket,
+                json!({
+                    "type": "auth_hello",
+                    "payload": {
+                        "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                    }
+                }),
+            )
+            .await;
+            let challenge = recv_json(socket).await;
+            assert_eq!(challenge["type"], "auth_challenge");
+        }
+
+        assert_eq!(state.challenges.len(), 2);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut socket_c = connect_socket(addr).await;
+        send_json(
+            &mut socket_c,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                }
+            }),
+        )
+        .await;
+
+        let challenge = recv_json(&mut socket_c).await;
+        assert_eq!(challenge["type"], "auth_challenge");
+        let challenge_id = challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("challenge_id");
+        assert!(state.challenges.get(challenge_id).is_some());
+        assert_eq!(state.challenges.len(), 1);
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_exit_clears_outstanding_challenge() {
+        let (addr, state, server_task) = spawn_test_server_with_state(test_config(10)).await;
+        let mut socket = connect_socket(addr).await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "auth_hello",
+                "payload": {
+                    "client_pubkey_b64": client_pubkey_b64_from_secret(random_client_secret_bytes())
+                }
+            }),
+        )
+        .await;
+
+        let challenge = recv_json(&mut socket).await;
+        assert_eq!(challenge["type"], "auth_challenge");
+        let challenge_id = challenge["payload"]["challenge_id"]
+            .as_str()
+            .expect("challenge_id")
+            .to_string();
+        assert!(state.challenges.get(&challenge_id).is_some());
+
+        drop(socket);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.challenges.get(&challenge_id).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("challenge should be cleaned up after socket exit");
+
+        assert!(state.challenges.get(&challenge_id).is_none());
+
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anonymous_send_connections_rate_limited_per_connection() {
         let (addr, server_task) = spawn_test_server(test_config(2)).await;
 
@@ -1207,6 +1404,243 @@ mod tests {
         captured_rx
     }
 
+    fn spawn_pausing_confirming_writer(
+        mut rx: mpsc::Receiver<OutboundFrame>,
+    ) -> (
+        mpsc::Receiver<String>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (captured_tx, captured_rx) = mpsc::channel(8);
+        let (first_deliver_seen_tx, first_deliver_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_first_deliver_tx, release_first_deliver_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut first_deliver_seen_tx = Some(first_deliver_seen_tx);
+            let mut release_first_deliver_rx = Some(release_first_deliver_rx);
+
+            while let Some(outbound) = rx.recv().await {
+                let serialized = outbound.serialized.clone();
+                let frame: serde_json::Value =
+                    serde_json::from_str(&serialized).expect("parse outbound frame");
+
+                if frame["type"] == "msg_deliver"
+                    && let Some(first_deliver_seen_tx) = first_deliver_seen_tx.take()
+                {
+                    let _ = first_deliver_seen_tx.send(());
+                    let _ = release_first_deliver_rx
+                        .take()
+                        .expect("release handle present")
+                        .await;
+                }
+
+                if let Some(delivery_tx) = outbound.delivery_tx {
+                    let _ = delivery_tx.send(Ok(()));
+                }
+                let _ = captured_tx.send(serialized).await;
+            }
+        });
+
+        (captured_rx, first_deliver_seen_rx, release_first_deliver_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_and_concurrent_send_no_duplicates() {
+        const BACKLOG_LEN: usize = 3;
+
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let client_secret_bytes = [7_u8; 32];
+        let (identity_hash, first_auth_frame) =
+            build_auth_prove_frame(&state, client_secret_bytes, "auth-prove-1");
+
+        let backlog_ids = (0..BACKLOG_LEN)
+            .map(|index| {
+                let message_id = Uuid::new_v4();
+                let (queued, depth) = state.queue.enqueue(
+                    identity_hash.clone(),
+                    message_id,
+                    STANDARD.encode(format!("backlog-{index}")),
+                );
+                assert!(queued);
+                assert_eq!(depth, index + 1);
+                message_id.to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let (recipient_out_tx, recipient_out_rx) = mpsc::channel::<OutboundFrame>(8);
+        let (mut first_auth_frames, first_backlog_seen_rx, release_first_backlog_tx) =
+            spawn_pausing_confirming_writer(recipient_out_rx);
+        let state_for_auth = state.clone();
+        let recipient_out_tx_for_auth = recipient_out_tx.clone();
+        let auth_task = tokio::spawn(async move {
+            run_auth_prove_frame(
+                &state_for_auth,
+                &recipient_out_tx_for_auth,
+                first_auth_frame,
+            )
+            .await
+        });
+
+        first_backlog_seen_rx
+            .await
+            .expect("first backlog delivery should be attempted");
+
+        let (sender_out_tx, sender_out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let mut sender_frames = spawn_confirming_writer(sender_out_rx);
+        let concurrent_message_id = Uuid::new_v4().to_string();
+        let concurrent_envelope_b64 = STANDARD.encode(b"concurrent-envelope");
+        let mut sender_authenticated_identity = None;
+        let mut sender_current_challenge_id = None;
+        let mut sender_rate_limit_key = "anon:sender".to_string();
+        let mut sender_last_pong = Instant::now();
+        let mut sender_connection_role = ConnectionRole::Undecided;
+        let allow_legacy_send = true;
+
+        let should_close = process_frame(
+            &state,
+            &sender_out_tx,
+            &mut sender_authenticated_identity,
+            &mut sender_current_challenge_id,
+            &mut sender_rate_limit_key,
+            &mut sender_last_pong,
+            &mut sender_connection_role,
+            &allow_legacy_send,
+            ClientFrame {
+                frame_type: "msg_send".to_string(),
+                req_id: Some("req-concurrent".to_string()),
+                payload: serde_json::json!({
+                    "message_id": concurrent_message_id.clone(),
+                    "recipient_hash_hex": identity_hash.clone(),
+                    "envelope_b64": concurrent_envelope_b64,
+                }),
+            },
+        )
+        .await;
+
+        assert!(!should_close);
+        let accepted = recv_serialized_frames(&mut sender_frames, 1).await;
+        let accepted_frame: serde_json::Value =
+            serde_json::from_str(&accepted[0]).expect("parse msg_accepted");
+        assert_eq!(accepted_frame["type"], "msg_accepted");
+        assert_eq!(accepted_frame["payload"]["queued"], true);
+        assert!(state.sessions.get(&identity_hash).is_none());
+        assert_eq!(state.queue.depth_for(&identity_hash), 1);
+
+        release_first_backlog_tx
+            .send(())
+            .expect("release first backlog delivery");
+
+        let (should_close, authenticated_identity) =
+            auth_task.await.expect("auth_prove task should complete");
+        assert!(!should_close);
+        let Some((registered_identity, session_token)) = authenticated_identity else {
+            panic!("auth_prove should register a session");
+        };
+        assert_eq!(registered_identity, identity_hash);
+
+        let first_auth_frames =
+            recv_serialized_frames(&mut first_auth_frames, BACKLOG_LEN + 1).await;
+        let first_delivered_ids = delivered_message_ids(&first_auth_frames);
+        assert_eq!(first_delivered_ids, backlog_ids);
+
+        // Messages sent after the atomic pop but before session publication remain queued
+        // for the next drain trigger, so ordering across that boundary is best-effort.
+        let queued_after_first_auth = state.queue.messages_for_recipient(&identity_hash);
+        assert_eq!(queued_after_first_auth.len(), 1);
+        assert_eq!(
+            queued_after_first_auth[0].message_id.to_string(),
+            concurrent_message_id
+        );
+
+        state.unregister_session(&identity_hash, session_token);
+        drop(recipient_out_tx);
+
+        let (identity_hash_again, second_auth_frame) =
+            build_auth_prove_frame(&state, client_secret_bytes, "auth-prove-2");
+        assert_eq!(identity_hash_again, identity_hash);
+
+        let (second_out_tx, second_out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let mut second_auth_frames = spawn_confirming_writer(second_out_rx);
+        let (should_close, authenticated_identity) =
+            run_auth_prove_frame(&state, &second_out_tx, second_auth_frame).await;
+        assert!(!should_close);
+        let Some((_, second_session_token)) = authenticated_identity else {
+            panic!("second auth_prove should register a session");
+        };
+        let second_auth_frames = recv_serialized_frames(&mut second_auth_frames, 2).await;
+        let second_delivered_ids = delivered_message_ids(&second_auth_frames);
+        assert_eq!(second_delivered_ids, vec![concurrent_message_id.clone()]);
+        state.unregister_session(&identity_hash, second_session_token);
+        drop(second_out_tx);
+
+        let delivered_ids = first_delivered_ids
+            .into_iter()
+            .chain(second_delivered_ids)
+            .collect::<Vec<_>>();
+        let delivered_unique = delivered_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let expected_ids = backlog_ids
+            .into_iter()
+            .chain(std::iter::once(concurrent_message_id))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(delivered_ids.len(), BACKLOG_LEN + 1);
+        assert_eq!(delivered_unique.len(), BACKLOG_LEN + 1);
+        assert_eq!(delivered_unique, expected_ids);
+        assert!(
+            state
+                .queue
+                .messages_for_recipient(&identity_hash)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_preserves_order_within_backlog() {
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let client_secret_bytes = [11_u8; 32];
+        let (identity_hash, auth_frame) =
+            build_auth_prove_frame(&state, client_secret_bytes, "auth-prove-order");
+        let backlog_ids = ["m1", "m2", "m3"]
+            .into_iter()
+            .map(|label| {
+                let message_id = Uuid::new_v4();
+                let (queued, _) = state.queue.enqueue(
+                    identity_hash.clone(),
+                    message_id,
+                    STANDARD.encode(label.as_bytes()),
+                );
+                assert!(queued);
+                message_id.to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(8);
+        let mut delivered_frames = spawn_confirming_writer(out_rx);
+        let (should_close, authenticated_identity) =
+            run_auth_prove_frame(&state, &out_tx, auth_frame).await;
+
+        assert!(!should_close);
+        let Some((_, session_token)) = authenticated_identity else {
+            panic!("auth_prove should register a session");
+        };
+
+        let delivered_frames = recv_serialized_frames(&mut delivered_frames, 4).await;
+        let delivered_ids = delivered_message_ids(&delivered_frames);
+        assert_eq!(delivered_ids, backlog_ids);
+        assert!(
+            state
+                .queue
+                .messages_for_recipient(&identity_hash)
+                .is_empty()
+        );
+
+        state.unregister_session(&identity_hash, session_token);
+        drop(out_tx);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_live_delivery_cleans_up_stale_session_and_keeps_message_queued() {
         let recipient_hash = "b".repeat(64);
@@ -1218,9 +1652,10 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel::<OutboundFrame>(1);
         drop(dead_rx);
 
-        state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
+        let _ = state.register_session(recipient_hash.clone(), dead_tx, Duration::from_secs(60));
 
-        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+        let mut current_challenge_id = None;
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1230,6 +1665,7 @@ mod tests {
             &state,
             &out_tx,
             &mut authenticated_identity,
+            &mut current_challenge_id,
             &mut rate_limit_key,
             &mut last_pong,
             &mut connection_role,
@@ -1255,6 +1691,96 @@ mod tests {
         assert_eq!(accepted["type"], "msg_accepted");
 
         let queued = state.queue.messages_for_recipient(&"b".repeat(64));
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_delivery_failure_only_evicts_stale_session() {
+        let recipient_hash = "b".repeat(64);
+        let sender_hash = "a".repeat(64);
+
+        let state = Arc::new(RelayState::new(test_config(10), None));
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(4);
+        let mut delivered_frames = spawn_confirming_writer(out_rx);
+        let (stale_tx, mut stale_rx) = mpsc::channel::<OutboundFrame>(1);
+        let (replacement_tx, _replacement_rx) = mpsc::channel::<OutboundFrame>(1);
+        let (deliver_seen_tx, deliver_seen_rx) = tokio::sync::oneshot::channel();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+
+        let stale_token =
+            state.register_session(recipient_hash.clone(), stale_tx, Duration::from_secs(60));
+
+        tokio::spawn(async move {
+            let outbound = stale_rx.recv().await.expect("stale outbound frame");
+            assert!(outbound.serialized.contains("\"msg_deliver\""));
+            let _ = deliver_seen_tx.send(());
+            let _ = fail_rx.await;
+            if let Some(delivery_tx) = outbound.delivery_tx {
+                let _ = delivery_tx.send(Err(()));
+            }
+        });
+
+        let state_for_process = state.clone();
+        let out_tx_for_process = out_tx.clone();
+        let recipient_hash_for_process = recipient_hash.clone();
+        let process_task = tokio::spawn(async move {
+            let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+            let mut current_challenge_id = None;
+            let mut rate_limit_key = sender_hash;
+            let mut last_pong = Instant::now();
+            let mut connection_role = ConnectionRole::Receive;
+            let allow_legacy_send = true;
+
+            process_frame(
+                &state_for_process,
+                &out_tx_for_process,
+                &mut authenticated_identity,
+                &mut current_challenge_id,
+                &mut rate_limit_key,
+                &mut last_pong,
+                &mut connection_role,
+                &allow_legacy_send,
+                ClientFrame {
+                    frame_type: "msg_send".to_string(),
+                    req_id: Some("req-race".to_string()),
+                    payload: serde_json::json!({
+                        "message_id": Uuid::new_v4().to_string(),
+                        "recipient_hash_hex": recipient_hash_for_process,
+                        "envelope_b64": STANDARD.encode(b"opaque-envelope"),
+                    }),
+                },
+            )
+            .await
+        });
+
+        deliver_seen_rx
+            .await
+            .expect("stale live delivery should be attempted");
+
+        let replacement_token = state.register_session(
+            recipient_hash.clone(),
+            replacement_tx,
+            Duration::from_secs(60),
+        );
+
+        let _ = fail_tx.send(());
+
+        let should_close = process_task.await.expect("process_frame task");
+        assert!(!should_close);
+
+        let session = state
+            .sessions
+            .get(&recipient_hash)
+            .expect("replacement session should remain registered");
+        assert_eq!(session.token, replacement_token);
+        assert_ne!(session.token, stale_token);
+
+        let accepted = delivered_frames.recv().await.expect("msg_accepted");
+        let accepted: serde_json::Value =
+            serde_json::from_str(&accepted).expect("parse msg_accepted");
+        assert_eq!(accepted["type"], "msg_accepted");
+
+        let queued = state.queue.messages_for_recipient(&recipient_hash);
         assert_eq!(queued.len(), 1);
     }
 
@@ -1373,13 +1899,14 @@ mod tests {
             ))
             .expect("fill recipient outbound queue");
 
-        state.register_session(
+        let _ = state.register_session(
             recipient_hash.clone(),
             recipient_tx,
             Duration::from_secs(60),
         );
 
-        let mut authenticated_identity = Some(sender_hash.clone());
+        let mut authenticated_identity = Some((sender_hash.clone(), Uuid::new_v4()));
+        let mut current_challenge_id = None;
         let mut rate_limit_key = sender_hash;
         let mut last_pong = Instant::now();
         let mut connection_role = ConnectionRole::Receive;
@@ -1390,6 +1917,7 @@ mod tests {
             &state,
             &out_tx,
             &mut authenticated_identity,
+            &mut current_challenge_id,
             &mut rate_limit_key,
             &mut last_pong,
             &mut connection_role,
@@ -1414,37 +1942,178 @@ mod tests {
         assert_eq!(queued[0].message_id, message_id);
     }
 
+    #[tokio::test]
+    async fn global_connection_limit_rejects_then_recovers_after_disconnect() {
+        let mut config = test_config(10);
+        config.max_connections = 1;
+        let (addr, state, server_task) = spawn_test_server_with_state(config).await;
+        let mut first = connect_socket(addr).await;
+        let rejected = connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .unwrap_err();
+        match rejected {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 503)
+            }
+            other => panic!("expected capacity rejection: {other}"),
+        }
+        assert_eq!(state.connection_slots.available_permits(), 0);
+        first.close(None).await.unwrap();
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.connection_slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect releases its connection slot");
+        let mut next = connect_socket(addr).await;
+        next.close(None).await.unwrap();
+        server_task.abort();
+    }
+
     async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let (addr, _, handle) = spawn_test_server_with_state(config).await;
+        (addr, handle)
+    }
+
+    async fn spawn_test_server_with_state(
+        config: Config,
+    ) -> (SocketAddr, Arc<RelayState>, tokio::task::JoinHandle<()>) {
         let state = Arc::new(RelayState::new(config, None));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("read test server addr");
-        let router = app(state);
+        let router = app(state.clone());
         let handle = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
                 .expect("serve test router");
         });
-        (addr, handle)
+        (addr, state, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_writer_cannot_block_frame_delivery_forever() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let send = tokio::spawn(async move {
+            super::send_frame(&tx, "pong", None, crate::protocol::EmptyPayload {}).await
+        });
+        // Retain the confirmation sender, emulating a socket stalled in write().
+        let held_frame = rx.recv().await.expect("queued frame");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(
+            send.await.unwrap(),
+            Err(super::SendFrameError::DeliveryFailed)
+        );
+        drop(held_frame);
+    }
+
+    async fn connect_socket(addr: SocketAddr) -> TestSocket {
+        connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .expect("connect websocket")
+            .0
     }
 
     async fn connect_authenticated_client(addr: SocketAddr) -> AuthenticatedClient {
-        let mut client_secret_bytes = [0_u8; 32];
-        rand::rng().fill_bytes(&mut client_secret_bytes);
+        let client_secret_bytes = random_client_secret_bytes();
         connect_authenticated_client_with_secret(addr, client_secret_bytes).await
+    }
+
+    fn build_auth_prove_frame(
+        state: &Arc<RelayState>,
+        client_secret_bytes: [u8; 32],
+        req_id: &str,
+    ) -> (String, ClientFrame) {
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
+        let (challenge_payload, challenge_record) =
+            auth::create_challenge(&client_pubkey_b64, state.config.challenge_ttl)
+                .expect("create auth challenge");
+        let challenge_id = challenge_record.challenge_id.clone();
+        state
+            .challenges
+            .insert(challenge_id.clone(), challenge_record);
+
+        let nonce = STANDARD
+            .decode(&challenge_payload.nonce_b64)
+            .expect("decode challenge nonce");
+        let server_pubkey_bytes: [u8; 32] = STANDARD
+            .decode(&challenge_payload.server_pubkey_b64)
+            .expect("decode server pubkey")
+            .try_into()
+            .expect("server pubkey length");
+        let server_public = PublicKey::from(server_pubkey_bytes);
+        let shared_secret = client_secret.diffie_hellman(&server_public);
+        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
+        let mut auth_key = [0_u8; 32];
+        let mut info =
+            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
+        info.extend_from_slice(challenge_id.as_bytes());
+        info.extend_from_slice(&nonce);
+        info.extend_from_slice(client_public.as_bytes());
+        hkdf.expand(&info, &mut auth_key)
+            .expect("derive auth proof key");
+
+        let signed_message = auth::proof_message(&challenge_id, challenge_payload.issued_at_ms);
+        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
+        mac.update(&signed_message);
+        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
+        let identity_hash = hex::encode(Sha256::digest(client_public.as_bytes()));
+
+        (
+            identity_hash,
+            ClientFrame {
+                frame_type: "auth_prove".to_string(),
+                req_id: Some(req_id.to_string()),
+                payload: serde_json::json!({
+                    "challenge_id": challenge_id,
+                    "proof_b64": proof_b64,
+                }),
+            },
+        )
+    }
+
+    async fn run_auth_prove_frame(
+        state: &Arc<RelayState>,
+        out_tx: &mpsc::Sender<OutboundFrame>,
+        frame: ClientFrame,
+    ) -> (bool, Option<(String, Uuid)>) {
+        let mut authenticated_identity = None;
+        let mut current_challenge_id = None;
+        let mut rate_limit_key = "anon:auth".to_string();
+        let mut last_pong = Instant::now();
+        let mut connection_role = ConnectionRole::Receive;
+        let allow_legacy_send = true;
+
+        let should_close = process_frame(
+            state,
+            out_tx,
+            &mut authenticated_identity,
+            &mut current_challenge_id,
+            &mut rate_limit_key,
+            &mut last_pong,
+            &mut connection_role,
+            &allow_legacy_send,
+            frame,
+        )
+        .await;
+
+        (should_close, authenticated_identity)
     }
 
     async fn connect_authenticated_client_with_secret(
         addr: SocketAddr,
         client_secret_bytes: [u8; 32],
     ) -> AuthenticatedClient {
-        let url = format!("ws://{addr}/v1/ws");
-        let (mut socket, _) = connect_async(url).await.expect("connect websocket");
+        let mut socket = connect_socket(addr).await;
 
         let client_secret = StaticSecret::from(client_secret_bytes);
         let client_public = PublicKey::from(&client_secret);
-        let client_pubkey_b64 = STANDARD.encode(client_public.as_bytes());
+        let client_pubkey_b64 = client_pubkey_b64_from_secret(client_secret_bytes);
 
         send_json(
             &mut socket,
@@ -1459,46 +2128,15 @@ mod tests {
 
         let challenge = recv_json(&mut socket).await;
         assert_eq!(challenge["type"], "auth_challenge");
-        let payload = &challenge["payload"];
-        let challenge_id = payload["challenge_id"].as_str().expect("challenge_id");
-        let nonce = STANDARD
-            .decode(payload["nonce_b64"].as_str().expect("nonce_b64"))
-            .expect("decode nonce");
-        let server_pubkey_bytes: [u8; 32] = STANDARD
-            .decode(
-                payload["server_pubkey_b64"]
-                    .as_str()
-                    .expect("server_pubkey_b64"),
-            )
-            .expect("decode server pubkey")
-            .try_into()
-            .expect("server pubkey length");
-        let server_public = PublicKey::from(server_pubkey_bytes);
-
-        let shared_secret = client_secret.diffie_hellman(&server_public);
-        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
-        let mut auth_key = [0_u8; 32];
-        let mut info =
-            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
-        info.extend_from_slice(challenge_id.as_bytes());
-        info.extend_from_slice(&nonce);
-        info.extend_from_slice(client_public.as_bytes());
-        hkdf.expand(&info, &mut auth_key).expect("derive auth key");
-
-        let issued_at_ms = payload["issued_at_ms"].as_i64().expect("issued_at_ms");
-        let signed_message = auth::proof_message(challenge_id, issued_at_ms);
-        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
-        mac.update(&signed_message);
-        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
 
         send_json(
             &mut socket,
             json!({
                 "type": "auth_prove",
-                "payload": {
-                    "challenge_id": challenge_id,
-                    "proof_b64": proof_b64
-                }
+                "payload": build_auth_prove_payload_from_challenge(
+                    &challenge["payload"],
+                    client_secret_bytes,
+                )
             }),
         )
         .await;
@@ -1517,6 +2155,65 @@ mod tests {
             socket,
             identity_hash,
         }
+    }
+
+    fn random_client_secret_bytes() -> [u8; 32] {
+        let mut client_secret_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut client_secret_bytes);
+        client_secret_bytes
+    }
+
+    fn client_pubkey_b64_from_secret(client_secret_bytes: [u8; 32]) -> String {
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        STANDARD.encode(client_public.as_bytes())
+    }
+
+    fn build_auth_prove_payload_from_challenge(
+        challenge_payload: &Value,
+        client_secret_bytes: [u8; 32],
+    ) -> Value {
+        let client_secret = StaticSecret::from(client_secret_bytes);
+        let client_public = PublicKey::from(&client_secret);
+        let challenge_id = challenge_payload["challenge_id"]
+            .as_str()
+            .expect("challenge_id");
+        let nonce = STANDARD
+            .decode(challenge_payload["nonce_b64"].as_str().expect("nonce_b64"))
+            .expect("decode nonce");
+        let server_pubkey_bytes: [u8; 32] = STANDARD
+            .decode(
+                challenge_payload["server_pubkey_b64"]
+                    .as_str()
+                    .expect("server_pubkey_b64"),
+            )
+            .expect("decode server pubkey")
+            .try_into()
+            .expect("server pubkey length");
+        let server_public = PublicKey::from(server_pubkey_bytes);
+
+        let shared_secret = client_secret.diffie_hellman(&server_public);
+        let hkdf = Hkdf::<Sha256>::new(Some(b"pigeon-relay-auth-v1"), shared_secret.as_bytes());
+        let mut auth_key = [0_u8; 32];
+        let mut info =
+            Vec::with_capacity(challenge_id.len() + nonce.len() + client_public.as_bytes().len());
+        info.extend_from_slice(challenge_id.as_bytes());
+        info.extend_from_slice(&nonce);
+        info.extend_from_slice(client_public.as_bytes());
+        hkdf.expand(&info, &mut auth_key).expect("derive auth key");
+
+        let issued_at_ms = challenge_payload["issued_at_ms"]
+            .as_i64()
+            .expect("issued_at_ms");
+        let signed_message = auth::proof_message(challenge_id, issued_at_ms);
+        let mut mac = HmacSha256::new_from_slice(&auth_key).expect("init hmac");
+        mac.update(&signed_message);
+        let proof_b64 = STANDARD.encode(mac.finalize().into_bytes());
+
+        json!({
+            "challenge_id": challenge_id,
+            "proof_b64": proof_b64,
+        })
     }
 
     async fn send_json(socket: &mut TestSocket, value: Value) {
@@ -1564,9 +2261,40 @@ mod tests {
         }
     }
 
+    async fn recv_serialized_frames(rx: &mut mpsc::Receiver<String>, count: usize) -> Vec<String> {
+        let mut frames = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timed out waiting for outbound frame")
+                .expect("outbound frame");
+            frames.push(frame);
+        }
+
+        frames
+    }
+
+    fn delivered_message_ids(frames: &[String]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|frame| {
+                let frame: serde_json::Value =
+                    serde_json::from_str(frame).expect("parse captured frame");
+                (frame["type"] == "msg_deliver").then(|| {
+                    frame["payload"]["message_id"]
+                        .as_str()
+                        .expect("delivered message_id")
+                        .to_string()
+                })
+            })
+            .collect()
+    }
+
     fn test_config(rate_limit_per_min: u32) -> Config {
         Config {
             relay_addr: "127.0.0.1:0".to_string(),
+            max_connections: 1024,
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
