@@ -6,7 +6,7 @@ Thank you for your interest in contributing to pigeon-relay. This document cover
 
 **Prerequisites:**
 
-- Rust 1.85 or later (the project uses edition 2024)
+- Rust 1.88 or later (the project uses edition 2024)
 - git
 
 **Build from source:**
@@ -45,6 +45,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 CI enforces both. Please run them locally before pushing.
+
+## Third-party notices
+
+When `Cargo.lock` changes, regenerate the dependency notices from the locked
+versions, including build/dev dependencies and all target platforms:
+
+```sh
+cargo install cargo-about --version 0.9.2 --features cli --locked
+cargo about generate --locked --all-features --fail about.hbs -o LICENSE-THIRD-PARTY
+```
+
+Review and commit the resulting `LICENSE-THIRD-PARTY` with the lockfile. The
+accepted license list in `about.toml` follows `deny.toml`; upstream license text
+is preserved verbatim. Binary distributions must include the applicable notices.
 
 ## Submitting a Pull Request
 

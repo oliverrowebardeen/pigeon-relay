@@ -268,7 +268,8 @@ The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to lo
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Dependencies retain their respective licenses; see
+[third-party notices](LICENSE-THIRD-PARTY).
 
 ## Security and deployment limits
 
