@@ -66,8 +66,20 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
+    let Ok(permit) = state.connection_slots.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay connection capacity reached",
+        )
+            .into_response();
+    };
     ws.max_message_size(max_ws_frame_size(state.config.max_message_bytes))
-        .on_upgrade(move |socket| handle_socket(state, socket))
+        .on_upgrade(move |socket| async move {
+            // Held across the entire connection; also released if upgrade fails.
+            let _permit = permit;
+            handle_socket(state, socket).await;
+        })
+        .into_response()
 }
 
 fn max_ws_frame_size(max_message_bytes: usize) -> usize {
@@ -1930,6 +1942,36 @@ mod tests {
         assert_eq!(queued[0].message_id, message_id);
     }
 
+    #[tokio::test]
+    async fn global_connection_limit_rejects_then_recovers_after_disconnect() {
+        let mut config = test_config(10);
+        config.max_connections = 1;
+        let (addr, state, server_task) = spawn_test_server_with_state(config).await;
+        let mut first = connect_socket(addr).await;
+        let rejected = connect_async(format!("ws://{addr}/v1/ws"))
+            .await
+            .unwrap_err();
+        match rejected {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 503)
+            }
+            other => panic!("expected capacity rejection: {other}"),
+        }
+        assert_eq!(state.connection_slots.available_permits(), 0);
+        first.close(None).await.unwrap();
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.connection_slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect releases its connection slot");
+        let mut next = connect_socket(addr).await;
+        next.close(None).await.unwrap();
+        server_task.abort();
+    }
+
     async fn spawn_test_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let (addr, _, handle) = spawn_test_server_with_state(config).await;
         (addr, handle)
@@ -2252,6 +2294,7 @@ mod tests {
     fn test_config(rate_limit_per_min: u32) -> Config {
         Config {
             relay_addr: "127.0.0.1:0".to_string(),
+            max_connections: 1024,
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,

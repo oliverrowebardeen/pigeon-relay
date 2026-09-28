@@ -139,6 +139,7 @@ All configuration is via environment variables with sensible defaults:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RELAY_ADDR` | `0.0.0.0:8080` | Listen address |
+| `RELAY_MAX_CONNECTIONS` | `1024` | Global active WebSocket cap (1–65536); excess upgrades receive HTTP 503 |
 | `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |
 | `RELAY_MAX_MESSAGE_BYTES` | `65536` | Maximum envelope size |
 | `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap |
@@ -271,6 +272,6 @@ The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to lo
 
 ## Security and deployment limits
 
-See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
+See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions; it does not bound pre-upgrade TCP connections or total queued data across recipients. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
 
 CI uses the committed lockfile, checks the minimum Rust version, denies dependency advisories/warnings, and scans full Git history. APNS requests and socket delivery confirmations have bounded waits. `jsonwebtoken` uses the AWS-LC backend to avoid the unused RSA dependency previously present in the default RustCrypto backend.

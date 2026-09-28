@@ -8,6 +8,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub relay_addr: String,
+    pub max_connections: usize,
     pub message_ttl: Duration,
     pub max_message_bytes: usize,
     pub max_queue_per_recipient: usize,
@@ -84,6 +85,12 @@ pub enum ConfigError {
     },
     #[error("invalid integer for {name}: {value}")]
     InvalidInteger { name: &'static str, value: String },
+    #[error("invalid integer for {name}: {value} (maximum is {max})")]
+    IntegerOutOfRange {
+        name: &'static str,
+        value: String,
+        max: usize,
+    },
     #[error("invalid integer for {name}: {value} (must be greater than zero)")]
     ZeroInteger { name: &'static str, value: String },
     #[error(
@@ -115,6 +122,15 @@ impl Config {
         F: Fn(&'static str) -> Option<String>,
     {
         let relay_addr = env_var_or_default(&get_var, "RELAY_ADDR", "0.0.0.0:8080");
+        let max_connections = parse_num(&get_var, "RELAY_MAX_CONNECTIONS", "1024")?;
+        require_non_zero(&max_connections)?;
+        if max_connections.value > 65_536 {
+            return Err(ConfigError::IntegerOutOfRange {
+                name: max_connections.name,
+                value: max_connections.raw,
+                max: 65_536,
+            });
+        }
         let message_ttl = parse_duration(&get_var, "RELAY_MESSAGE_TTL", "168h")?;
         let max_message_bytes = parse_num(&get_var, "RELAY_MAX_MESSAGE_BYTES", "65536")?;
         let max_queue_per_recipient = parse_num(&get_var, "RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
@@ -209,6 +225,7 @@ impl Config {
 
         Ok(Self {
             relay_addr,
+            max_connections: max_connections.value,
             message_ttl: message_ttl.value,
             max_message_bytes: max_message_bytes.value,
             max_queue_per_recipient: max_queue_per_recipient.value,
@@ -383,6 +400,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn connection_limit_validated() {
+        assert_eq!(config_from(&[]).unwrap().max_connections, 1024);
+        assert_eq!(
+            config_from(&[("RELAY_MAX_CONNECTIONS", "2")])
+                .unwrap()
+                .max_connections,
+            2
+        );
+        for value in ["0", "65537", "-1", "invalid"] {
+            assert!(config_from(&[("RELAY_MAX_CONNECTIONS", value)]).is_err());
+        }
     }
 
     #[test]

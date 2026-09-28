@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::close_code;
 use chrono::Utc;
 use dashmap::DashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::apns::ApnsClient;
@@ -100,6 +100,7 @@ struct RateLimitWindow {
 #[derive(Debug)]
 pub struct RelayState {
     pub config: Config,
+    pub connection_slots: Arc<Semaphore>,
     pub queue: QueueStore,
     pub sessions: DashMap<String, SessionHandle>,
     pub challenges: DashMap<String, ChallengeRecord>,
@@ -113,6 +114,7 @@ impl RelayState {
         let queue = QueueStore::new(config.message_ttl, config.max_queue_per_recipient);
 
         Self {
+            connection_slots: Arc::new(Semaphore::new(config.max_connections)),
             config,
             queue,
             sessions: DashMap::new(),
@@ -264,6 +266,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             relay_addr: "127.0.0.1:0".to_string(),
+            max_connections: 1024,
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
