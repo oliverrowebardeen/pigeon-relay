@@ -4,7 +4,7 @@ A WebSocket relay server for opaque encrypted envelopes for [Pigeon](https://git
 
 The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
 
-**Try Pigeon:** [TestFlight invitation](https://testflight.apple.com), subject to available builds and capacity. You can also build the [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) from source.
+**Pigeon is pre-beta; no TestFlight build is currently available.** Developers can build the [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) from source. Bluetooth testing requires physical iPhones.
 
 ## Architecture
 
