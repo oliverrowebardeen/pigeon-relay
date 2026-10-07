@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::str::FromStr;
 use std::time::Duration;
@@ -12,6 +13,7 @@ pub struct Config {
     pub message_ttl: Duration,
     pub max_message_bytes: usize,
     pub max_queue_per_recipient: usize,
+    pub max_total_queued_bytes: usize,
     pub max_session_send_queue: usize,
     pub challenge_ttl: Duration,
     pub session_ttl: Duration,
@@ -36,6 +38,7 @@ pub struct ApnsConfig {
     pub production_key_id: Option<String>,
     pub production_private_key_path: Option<String>,
     pub topic: Option<String>,
+    pub allowed_topics: HashSet<String>,
     pub environment: ApnsEnvironment,
 }
 
@@ -134,6 +137,8 @@ impl Config {
         let message_ttl = parse_duration(&get_var, "RELAY_MESSAGE_TTL", "168h")?;
         let max_message_bytes = parse_num(&get_var, "RELAY_MAX_MESSAGE_BYTES", "65536")?;
         let max_queue_per_recipient = parse_num(&get_var, "RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
+        let max_total_queued_bytes =
+            parse_num(&get_var, "RELAY_MAX_TOTAL_QUEUED_BYTES", "268435456")?;
         let max_session_send_queue = parse_num(&get_var, "RELAY_MAX_SESSION_SEND_QUEUE", "128")?;
         let challenge_ttl = parse_duration(&get_var, "RELAY_CHALLENGE_TTL", "30s")?;
         let session_ttl = parse_duration(&get_var, "RELAY_SESSION_TTL", "24h")?;
@@ -150,6 +155,7 @@ impl Config {
 
         require_non_zero(&max_message_bytes)?;
         require_non_zero(&max_queue_per_recipient)?;
+        require_non_zero(&max_total_queued_bytes)?;
         require_non_zero(&max_session_send_queue)?;
         require_non_zero(&rate_limit_per_min)?;
         require_non_zero(&max_concurrent_challenges)?;
@@ -166,6 +172,18 @@ impl Config {
             });
         }
 
+        let apns_topic = get_var("APNS_TOPIC")
+            .map(|topic| topic.trim().to_string())
+            .filter(|topic| !topic.is_empty());
+        let mut allowed_topics: HashSet<String> = get_var("APNS_ALLOWED_TOPICS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .map(str::to_string)
+            .collect();
+        allowed_topics.extend(apns_topic.iter().cloned());
+
         let apns = ApnsConfig {
             enabled: apns_enabled,
             team_id: get_var("APNS_TEAM_ID"),
@@ -175,7 +193,8 @@ impl Config {
             sandbox_private_key_path: get_var("APNS_SANDBOX_PRIVATE_KEY_PATH"),
             production_key_id: get_var("APNS_PRODUCTION_KEY_ID"),
             production_private_key_path: get_var("APNS_PRODUCTION_PRIVATE_KEY_PATH"),
-            topic: get_var("APNS_TOPIC"),
+            topic: apns_topic,
+            allowed_topics,
             environment: apns_environment,
         };
 
@@ -229,6 +248,7 @@ impl Config {
             message_ttl: message_ttl.value,
             max_message_bytes: max_message_bytes.value,
             max_queue_per_recipient: max_queue_per_recipient.value,
+            max_total_queued_bytes: max_total_queued_bytes.value,
             max_session_send_queue: max_session_send_queue.value,
             challenge_ttl: challenge_ttl.value,
             session_ttl: session_ttl.value,
@@ -417,6 +437,23 @@ mod tests {
     }
 
     #[test]
+    fn total_queue_byte_limit_validated() {
+        assert_eq!(
+            config_from(&[]).unwrap().max_total_queued_bytes,
+            268_435_456
+        );
+        assert_eq!(
+            config_from(&[("RELAY_MAX_TOTAL_QUEUED_BYTES", "1024")])
+                .unwrap()
+                .max_total_queued_bytes,
+            1024
+        );
+        for value in ["0", "-1", "invalid"] {
+            assert!(config_from(&[("RELAY_MAX_TOTAL_QUEUED_BYTES", value)]).is_err());
+        }
+    }
+
+    #[test]
     fn zero_session_send_queue_rejected() {
         let err = config_from(&[("RELAY_MAX_SESSION_SEND_QUEUE", "0")])
             .expect_err("zero session queue should fail");
@@ -447,6 +484,33 @@ mod tests {
         let err =
             config_from(&[("APNS_ENV", "staging")]).expect_err("unknown apns env should fail");
         assert!(matches!(err, ConfigError::InvalidApnsEnvironment(_)));
+    }
+
+    #[test]
+    fn apns_topics_include_default_and_trimmed_nonempty_extras() {
+        let config = config_from(&[
+            ("APNS_TOPIC", "com.example.pigeon"),
+            (
+                "APNS_ALLOWED_TOPICS",
+                " , com.example.pigeon.beta, , com.example.pigeon.beta ,",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.apns.allowed_topics,
+            HashSet::from([
+                "com.example.pigeon".to_string(),
+                "com.example.pigeon.beta".to_string(),
+            ])
+        );
+        assert!(config_from(&[]).unwrap().apns.allowed_topics.is_empty());
+        assert_eq!(
+            config_from(&[("APNS_TOPIC", "com.example.pigeon")])
+                .unwrap()
+                .apns
+                .allowed_topics,
+            HashSet::from(["com.example.pigeon".to_string()])
+        );
     }
 
     #[test]

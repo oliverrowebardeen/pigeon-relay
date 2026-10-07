@@ -50,13 +50,35 @@ async fn main() {
         "starting pigeon-relay"
     );
 
-    let shutdown = async {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received ctrl-c; shutting down gracefully");
-    };
-
-    if let Err(error) = server::run_server(state, shutdown).await {
+    if let Err(error) = server::run_server(state, shutdown_signal()).await {
         error!(?error, "relay server stopped with error");
         std::process::exit(1);
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+        "Ctrl-C"
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+        "SIGTERM"
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<&str>();
+
+    let signal = tokio::select! {
+        signal = ctrl_c => signal,
+        signal = terminate => signal,
+    };
+    info!(signal, "received shutdown signal; shutting down gracefully");
 }

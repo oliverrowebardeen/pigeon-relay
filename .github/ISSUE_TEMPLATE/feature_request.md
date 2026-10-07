@@ -22,7 +22,7 @@ Other approaches you thought about and why they did not fit.
 
 - Does this require a protocol change (a new frame type, a change to existing payloads)?
 - Does this require a configuration change (new `RELAY_*` env var, removed default)?
-- Does this affect the zero-knowledge / sealed-sender properties? If yes, explain why it is still safe.
+- Does this affect the documented confidentiality, authentication, or metadata exposure? If yes, explain why it is still safe.
 
 ## Additional Context
 

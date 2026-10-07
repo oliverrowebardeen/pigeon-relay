@@ -523,11 +523,23 @@ async fn process_frame(
                 return false;
             }
 
-            let (queued, depth) = state.queue.enqueue(
+            let (queued, depth) = match state.queue.enqueue(
                 payload.recipient_hash_hex.clone(),
                 message_id,
                 payload.envelope_b64.clone(),
-            );
+            ) {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = send_error(
+                        out_tx,
+                        frame.req_id,
+                        "queue_full",
+                        "message queue capacity reached",
+                    )
+                    .await;
+                    return false;
+                }
+            };
 
             let accepted_payload = MessageAcceptedPayload {
                 message_id: payload.message_id.clone(),
@@ -647,20 +659,29 @@ async fn process_frame(
                             client.default_environment()
                         })
                 });
-            let has_topic_override = payload
-                .topic
+            let has_topic_override = payload.topic.is_some();
+            let topic_override = payload.topic.map(|topic| topic.trim().to_string());
+            if topic_override
                 .as_ref()
-                .is_some_and(|topic| !topic.trim().is_empty());
+                .is_some_and(|topic| !state.config.apns.allowed_topics.contains(topic))
+            {
+                let _ = send_error(
+                    out_tx,
+                    frame.req_id,
+                    "bad_payload",
+                    "APNS topic is not allowed",
+                )
+                .await;
+                return false;
+            }
+            let topic_override = topic_override.or_else(|| state.config.apns.topic.clone());
 
             state.push_tokens.insert(
                 identity_hash.clone(),
                 PushRegistration {
                     device_token_hex: payload.device_token_hex,
                     apns_env,
-                    topic_override: payload.topic.and_then(|topic| {
-                        let trimmed = topic.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.to_string())
-                    }),
+                    topic_override,
                     last_push_at: None,
                     registered_at: Instant::now(),
                 },
@@ -763,7 +784,13 @@ async fn deliver_queued_messages(
         if let Err(error) = send_frame(sender, "msg_deliver", None, payload).await {
             let mut undelivered = vec![queued];
             undelivered.extend(queued_messages);
-            state.queue.requeue_messages(undelivered);
+            let dropped = state.queue.requeue_messages(undelivered);
+            if dropped > 0 {
+                warn!(
+                    dropped,
+                    "queue capacity reached; dropped undelivered messages"
+                );
+            }
             return Err(error);
         }
     }
@@ -1456,11 +1483,14 @@ mod tests {
         let backlog_ids = (0..BACKLOG_LEN)
             .map(|index| {
                 let message_id = Uuid::new_v4();
-                let (queued, depth) = state.queue.enqueue(
-                    identity_hash.clone(),
-                    message_id,
-                    STANDARD.encode(format!("backlog-{index}")),
-                );
+                let (queued, depth) = state
+                    .queue
+                    .enqueue(
+                        identity_hash.clone(),
+                        message_id,
+                        STANDARD.encode(format!("backlog-{index}")),
+                    )
+                    .unwrap();
                 assert!(queued);
                 assert_eq!(depth, index + 1);
                 message_id.to_string()
@@ -1607,11 +1637,14 @@ mod tests {
             .into_iter()
             .map(|label| {
                 let message_id = Uuid::new_v4();
-                let (queued, _) = state.queue.enqueue(
-                    identity_hash.clone(),
-                    message_id,
-                    STANDARD.encode(label.as_bytes()),
-                );
+                let (queued, _) = state
+                    .queue
+                    .enqueue(
+                        identity_hash.clone(),
+                        message_id,
+                        STANDARD.encode(label.as_bytes()),
+                    )
+                    .unwrap();
                 assert!(queued);
                 message_id.to_string()
             })
@@ -1782,6 +1815,152 @@ mod tests {
 
         let queued = state.queue.messages_for_recipient(&recipient_hash);
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_limits_return_same_error_without_live_delivery() {
+        for global_limit in [false, true] {
+            let mut config = test_config(10);
+            config.max_queue_per_recipient = 1;
+            if global_limit {
+                config.max_total_queued_bytes = 1;
+            }
+            let state = Arc::new(RelayState::new(config, None));
+            let recipient = "b".repeat(64);
+            if !global_limit {
+                state
+                    .queue
+                    .enqueue(recipient.clone(), Uuid::new_v4(), STANDARD.encode(b"first"))
+                    .unwrap();
+            }
+            let (recipient_tx, mut recipient_rx) = mpsc::channel(4);
+            state.register_session(recipient.clone(), recipient_tx, Duration::from_secs(60));
+            let (out_tx, out_rx) = mpsc::channel(4);
+            let mut frames = spawn_confirming_writer(out_rx);
+            let mut identity = None;
+            let mut challenge = None;
+            let mut rate_key = "anon:test".to_string();
+            let mut last_pong = Instant::now();
+            let mut role = ConnectionRole::Send;
+            assert!(
+                !process_frame(
+                    &state,
+                    &out_tx,
+                    &mut identity,
+                    &mut challenge,
+                    &mut rate_key,
+                    &mut last_pong,
+                    &mut role,
+                    &false,
+                    ClientFrame {
+                        frame_type: "msg_send".to_string(),
+                        req_id: Some("capacity-test".to_string()),
+                        payload: json!({
+                            "message_id": Uuid::new_v4().to_string(),
+                            "recipient_hash_hex": recipient,
+                            "envelope_b64": STANDARD.encode(b"rejected"),
+                        }),
+                    },
+                )
+                .await
+            );
+            let response: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["req_id"], "capacity-test");
+            assert_eq!(response["payload"]["code"], "queue_full");
+            assert_eq!(
+                state.queue.depth_for(&recipient),
+                usize::from(!global_limit)
+            );
+            assert!(matches!(
+                recipient_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    async fn push_registration_result(topic: Option<&str>) -> (Value, Option<PushRegistration>) {
+        let mut config = test_config(10);
+        config.apns.topic = Some("com.example.pigeon".to_string());
+        config.apns.allowed_topics = ["com.example.pigeon", "com.example.pigeon.beta"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let state = Arc::new(RelayState::new(config, None));
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let mut frames = spawn_confirming_writer(out_rx);
+        let identity = "a".repeat(64);
+        let mut authenticated_identity = Some((identity.clone(), Uuid::new_v4()));
+        let mut current_challenge_id = None;
+        let mut rate_limit_key = identity.clone();
+        let mut last_pong = Instant::now();
+        let mut role = ConnectionRole::Receive;
+        let mut payload = json!({"device_token_hex": "aabb", "apns_env": "sandbox"});
+        if let Some(topic) = topic {
+            payload["topic"] = json!(topic);
+        }
+        assert!(
+            !process_frame(
+                &state,
+                &out_tx,
+                &mut authenticated_identity,
+                &mut current_challenge_id,
+                &mut rate_limit_key,
+                &mut last_pong,
+                &mut role,
+                &false,
+                ClientFrame {
+                    frame_type: "push_register".to_string(),
+                    req_id: Some("push-test".to_string()),
+                    payload,
+                },
+            )
+            .await
+        );
+        let response: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(response["req_id"], "push-test");
+        let stored = state.push_tokens.get(&identity).map(|entry| entry.clone());
+        (response, stored)
+    }
+
+    #[tokio::test]
+    async fn push_register_rejects_foreign_or_empty_topic_without_storing() {
+        for topic in ["com.example.foreign", "", "   "] {
+            let (response, stored) = push_registration_result(Some(topic)).await;
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["payload"]["code"], "bad_payload");
+            assert!(stored.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn push_register_accepts_configured_topic() {
+        let (response, stored) = push_registration_result(Some("com.example.pigeon")).await;
+        assert_eq!(response["type"], "push_registered");
+        assert_eq!(
+            stored.unwrap().topic_override.as_deref(),
+            Some("com.example.pigeon")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_register_accepts_extra_allowed_topic() {
+        let (response, stored) = push_registration_result(Some("com.example.pigeon.beta")).await;
+        assert_eq!(response["type"], "push_registered");
+        assert_eq!(
+            stored.unwrap().topic_override.as_deref(),
+            Some("com.example.pigeon.beta")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_register_omitted_topic_uses_default() {
+        let (response, stored) = push_registration_result(None).await;
+        assert_eq!(response["type"], "push_registered");
+        assert_eq!(
+            stored.unwrap().topic_override.as_deref(),
+            Some("com.example.pigeon")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2298,6 +2477,7 @@ mod tests {
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
+            max_total_queued_bytes: 268_435_456,
             max_session_send_queue: 128,
             challenge_ttl: Duration::from_secs(30),
             session_ttl: Duration::from_secs(3600),
@@ -2318,6 +2498,7 @@ mod tests {
                 production_key_id: None,
                 production_private_key_path: None,
                 topic: None,
+                allowed_topics: Default::default(),
                 environment: ApnsEnvironment::Sandbox,
             },
         }

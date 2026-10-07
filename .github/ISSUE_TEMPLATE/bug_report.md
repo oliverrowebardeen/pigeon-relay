@@ -7,7 +7,7 @@ assignees: ""
 ---
 
 <!--
-SECURITY VULNERABILITIES: do not open a public issue. Email security@example.com.
+SECURITY VULNERABILITIES: do not open a public issue. Use GitHub private vulnerability reporting.
 See SECURITY.md for the disclosure process.
 -->
 
@@ -34,7 +34,7 @@ What actually happened. Include any error output, panic backtrace, or relevant l
 - Commit hash or release tag:
 - `rustc --version`:
 - OS / kernel:
-- Configuration overrides (any non-default `RELAY_*` or `APNS_*` env vars set):
+- Relevant configuration variable names and non-sensitive values (omit keys, tokens, personal paths, and identifiers):
 - Client(s) connecting to the relay (Pigeon iOS version, custom test client, etc.):
 
 ## Additional Context

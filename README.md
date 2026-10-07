@@ -2,7 +2,9 @@
 
 A WebSocket relay server for opaque encrypted envelopes for [Pigeon](https://github.com/oliverrowebardeen/pigeon-ios) -- an end-to-end encrypted messenger that communicates over BLE mesh, internet relay, or both.
 
-The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
+The relay forwards base64 envelopes addressed by recipient public-key hash. It has no message decryption keys and does not log envelope payloads. Clients are responsible for encrypting and authenticating their contents; the relay cannot verify that an envelope is encrypted. There are no accounts, usernames, or passwords: receive identity is a Curve25519 keypair.
+
+**Experimental and not independently security-audited.** Do not rely on this relay for sensitive communications. See [security and deployment limits](#security-and-deployment-limits).
 
 **Pigeon is pre-beta; no TestFlight build is currently available.** Developers can build the [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) from source. Bluetooth testing requires physical iPhones.
 
@@ -21,7 +23,7 @@ The relay never decrypts, inspects, or logs message contents. It stores and forw
           +----------> [ Relay ] <------------+
           |         (opaque box)              |
           |                                   |
-          |   Anonymous send conn             |
+          |   Unauthenticated send conn       |
           |   msg_send(envelope_b64)          |
           +----------> [ Queue ] ------------>+
           |         never decrypted       msg_deliver
@@ -39,7 +41,7 @@ The relay never decrypts, inspects, or logs message contents. It stores and forw
      Phone C (BLE-only) --> BLE --> Phone B (bridge) --> WS --> Relay --> Phone A
 ```
 
-Every message between clients is encrypted end-to-end with AES-256-GCM before it reaches the relay. The relay sees only opaque base64 blobs and identity hashes -- never plaintext, never sender names, never message content.
+Pigeon clients are expected to encrypt envelopes before sending them to the relay. The server also sees routing and connection metadata, including authentication public keys, recipient hashes, network addresses, timing, sizes, and APNS device tokens when push is enabled. It does not validate the client encryption scheme.
 
 ## Key Design Decisions
 
@@ -47,7 +49,7 @@ Every message between clients is encrypted end-to-end with AES-256-GCM before it
 
 **Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
 
-**Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+**Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` for the fixed-size proof comparison.
 
 **Sealed sender.** The send protocol omits the sender identity. Receive connections are authenticated solely for delivery routing. `msg_deliver` contains the encrypted envelope, message ID, and timestamp. This reduces exposed protocol metadata; it does not stop a relay operator or network observer from correlating traffic.
 
@@ -84,7 +86,7 @@ Client                          Relay
 
 WebSocket endpoint: `/v1/ws`
 
-Connections have a **role** determined by their first frame: `auth_hello` assigns the **receive** role, `msg_send` assigns the **send** role. Roles are immutable for the lifetime of the connection.
+Connections have a **role** determined by their first non-keepalive frame: `auth_hello` assigns the **receive** role, `msg_send` assigns the **send** role. Roles are immutable for the lifetime of the connection.
 
 All frames are JSON with a `type` field:
 
@@ -108,23 +110,25 @@ All frames are JSON with a `type` field:
 **Prerequisites:**
 - Rust 1.88+ (this project uses edition 2024)
 - Git
+- A C/C++ build toolchain and CMake for the AWS-LC cryptography dependency
 
 ```bash
 git clone https://github.com/oliverrowebardeen/pigeon-relay.git
 cd pigeon-relay
-cargo build --release
+cargo build --release --locked
 ```
 
 ## Running
 
 ```bash
-# Optional: configure via environment variables (see below)
-source .env 2>/dev/null || true
-
-cargo run --release
+# Optional: copy and edit the local configuration
+cp .env.example .env
+./scripts/dev-run.sh
 ```
 
-Default bind: `0.0.0.0:8080`
+The development script binds to `127.0.0.1:8080` unless `RELAY_ADDR` is set and exports variables from `.env`. It sources that file as shell code using `set -a` to export assignments: use only a file you trust. The example sets `RUST_LOG=pigeon_relay=info` so startup and operational messages are visible; the logging target uses an underscore.
+
+For direct execution, export any configuration variables and run `cargo run --release --locked`. The binary itself defaults to `0.0.0.0:8080` and does not load `.env`.
 
 Health check:
 
@@ -134,19 +138,21 @@ curl http://127.0.0.1:8080/healthz
 
 ## Configuration
 
-All configuration is via environment variables with sensible defaults:
+All configuration is via environment variables. [.env.example](.env.example) lists every supported setting and uses loopback with APNS disabled for local development. Replace the example APNS identifiers, topic, and key paths with your own before enabling push. Apart from the listen address and logging filter, its active relay settings match the built-in defaults below:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `RUST_LOG` | `error` | Tracing filter; the example uses `pigeon_relay=info` for startup and operational logs |
 | `RELAY_ADDR` | `0.0.0.0:8080` | Listen address |
 | `RELAY_MAX_CONNECTIONS` | `1024` | Global active WebSocket cap (1–65536); excess upgrades receive HTTP 503 |
 | `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |
 | `RELAY_MAX_MESSAGE_BYTES` | `65536` | Maximum envelope size |
-| `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap |
+| `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap; excess enqueues receive `queue_full` |
+| `RELAY_MAX_TOTAL_QUEUED_BYTES` | `268435456` (256 MiB) | Global queue byte budget, including stored base64 strings and charged message/recipient bookkeeping; excess enqueues receive `queue_full` |
 | `RELAY_MAX_SESSION_SEND_QUEUE` | `128` | Per-websocket outbound buffer cap before the session is treated as stale |
 | `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
 | `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
-| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |
+| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per authenticated identity or unauthenticated connection (see below) |
 | `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
 | `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
 | `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
@@ -156,7 +162,7 @@ All configuration is via environment variables with sensible defaults:
 
 ### APNS Configuration
 
-When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offline recipients:
+When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offline recipients. APNS connections time out after 5 seconds and requests after 10 seconds:
 
 | Variable | Description |
 |----------|-------------|
@@ -168,8 +174,11 @@ When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offli
 | `APNS_SANDBOX_PRIVATE_KEY_PATH` | Sandbox-specific key path |
 | `APNS_PRODUCTION_KEY_ID` | Production-specific key ID (overrides default) |
 | `APNS_PRODUCTION_PRIVATE_KEY_PATH` | Production-specific key path |
-| `APNS_TOPIC` | App bundle ID |
+| `APNS_TOPIC` | Default app bundle ID; always allowed and used when registration omits `topic` |
+| `APNS_ALLOWED_TOPICS` | Optional comma-separated additional allowed bundle IDs; whitespace is trimmed and empty entries ignored |
 | `APNS_ENV` | `sandbox` or `production` (default `sandbox`) |
+
+A `push_register` topic must be in `APNS_TOPIC` or `APNS_ALLOWED_TOPICS`; other topics are rejected with `bad_payload` without storing the registration.
 
 Use `production` for TestFlight and App Store builds. Use `sandbox` for debug builds installed from Xcode.
 
@@ -186,14 +195,14 @@ The push payload is a silent background notification:
 
 Rate limiting is scoped to prevent abuse while supporting bridge mode:
 
-- **Send connections (anonymous):** per WebSocket connection (`anon:<connection-id>`)
+- **Unauthenticated (sealed-sender) send connections:** per WebSocket connection (`anon:<connection-id>`)
 - **Receive connections (authenticated):** per identity hash after authentication, per connection before
 
 This means multiple BLE-only peers tunneled through a single bridge phone each get their own rate limit budget, rather than sharing one.
 
 ## Legacy Compatibility
 
-`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated anonymous send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
+`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated unauthenticated (sealed-sender) send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
 
 Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older clients that have not yet migrated.
 
@@ -210,12 +219,15 @@ Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older 
 
 Messages are stored in an in-memory queue keyed by recipient identity hash:
 
-- **TTL:** configurable per message (default 7 days)
-- **Deduplication:** same message ID to same recipient is only queued once
-- **Per-recipient cap:** oldest messages are dropped when the cap is exceeded
-- **Drain on connect:** queued messages are delivered immediately when a recipient authenticates
+- **TTL:** configured for the relay and applied when each message is queued (default 7 days)
+- **Deduplication:** duplicate IDs are suppressed while queued for the same recipient; delivery removes that deduplication entry, so retries can be delivered again
+- **Per-recipient cap:** new messages are rejected with `queue_full` when the cap is reached
+- **Global byte cap:** `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across all recipients, including bookkeeping for empty envelopes; uses the same `queue_full` error without evicting accepted messages
+- **Drain on connect:** the existing backlog is drained when a recipient authenticates; messages arriving during that drain can remain queued until the next authentication
 
-The queue is not persisted to disk. A server restart clears all queued messages.
+Delivery is best-effort, with no end-to-end acknowledgement or exactly-once guarantee. A completed WebSocket write does not prove that the client processed the message. Socket delivery confirmations have bounded waits. Live delivery failures leave the message queued. Draining a queue releases its byte reservation; failed backlog deliveries are requeued only if capacity remains, otherwise dropped with a warning. Delivery, dequeue, and expiry release capacity, and empty recipient queues are removed.
+
+The byte budget charges string capacities and message, deduplication, and recipient bookkeeping. Allocator/container overhead, drained messages awaiting delivery, and buffers outside the queue mean it is not an exact process-memory limit. The queue is not persisted to disk. A server restart clears all queued messages.
 
 ## Testing
 
@@ -229,38 +241,51 @@ Tests include integration tests that stand up a real WebSocket server and perfor
 
 CI runs on every push and pull request:
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`
 - `cargo test --all-targets --all-features --locked`
 - `cargo deny check advisories bans licenses sources`
-- `gitleaks`
+- `cargo audit --deny warnings`
+- `cargo +1.88.0 check --all-targets --locked`
+- `gitleaks git . --log-opts="--all" --redact`
 
 ## Deployment
 
-The relay is designed to run as a systemd service. No `.service` file is included -- create one for your environment. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
+For a Linux deployment, build with `cargo build --release --locked`, install `target/release/pigeon-relay` as `/usr/local/bin/pigeon-relay`, and create a dedicated `pigeon-relay` service account. Bind the relay to loopback and put a reverse proxy with TLS in front of it. For example, adapt this [Caddy reverse-proxy configuration](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy) for a hostname you control:
 
-**Server layout:**
-
-```
-/opt/pigeon-relay/          # git clone of this repo
-/etc/pigeon-relay/
-  pigeon-relay.env          # environment variables (secrets, config)
-  AuthKey_*.p8              # APNS signing keys (chmod 600)
+```caddyfile
+relay.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
 ```
 
-**Update from a new push:**
+Point the hostname at your server and configure connection and request limits at your proxy or network edge for your workload. Clients connect to `wss://relay.example.com/v1/ws`. Keep the relay's port inaccessible from the public network. This minimal proxy example does not configure abuse-prevention limits.
 
-```bash
-cd /opt/pigeon-relay
-git pull origin main
-source "$HOME/.cargo/env"
-cargo build --release
-systemctl restart pigeon-relay
-systemctl status pigeon-relay   # verify it started
+Example `/etc/systemd/system/pigeon-relay.service` (adapt the service account and installation paths to your host):
+
+```ini
+[Unit]
+Description=Pigeon WebSocket relay
+After=network.target
+
+[Service]
+User=pigeon-relay
+Group=pigeon-relay
+ExecStart=/usr/local/bin/pigeon-relay
+Environment=RELAY_ADDR=127.0.0.1:8080
+Environment=RUST_LOG=pigeon_relay=info
+EnvironmentFile=-/etc/pigeon-relay/relay.conf
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to load secrets at startup. The `.env` file in the repo directory is for local development only and is never committed.
+Store optional `KEY=value` environment overrides in `/etc/pigeon-relay/relay.conf`, outside the checkout. Use literal values rather than shell commands: systemd does not source this file as a shell script. See the [systemd environment reference](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=). Keep APNS signing keys outside the repository, restrict their permissions, and make them readable only by the service account and administrators. The local development `.env` file is never committed.
 
-**Note:** Restarting the service drops all active WebSocket connections and clears the in-memory message queue. Connected clients will reconnect automatically.
+After installing or updating the unit, run `sudo systemctl daemon-reload` and `sudo systemctl enable --now pigeon-relay`. For binary updates, install the new build, run `sudo systemctl restart pigeon-relay`, and verify `sudo systemctl status pigeon-relay` plus the `/healthz` endpoint. View logs with `sudo journalctl -u pigeon-relay`.
+
+The relay handles Ctrl-C and, on Unix, SIGTERM through its server shutdown path. Stopping or restarting the service drops active WebSocket connections and clears the in-memory queue; clients must reconnect and retry as appropriate. Shutdown does not persist or guarantee delivery of pending messages.
 
 ## Related
 
@@ -273,6 +298,6 @@ The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to lo
 
 ## Security and deployment limits
 
-See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions; it does not bound pre-upgrade TCP connections or total queued data across recipients. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
+See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions and `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients; neither bounds pre-upgrade TCP connections or total process memory. Unauthenticated send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
 
 CI uses the committed lockfile, checks the minimum Rust version, denies dependency advisories/warnings, and scans full Git history. APNS requests and socket delivery confirmations have bounded waits. `jsonwebtoken` uses the AWS-LC backend to avoid the unused RSA dependency previously present in the default RustCrypto backend.
