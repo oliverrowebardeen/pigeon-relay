@@ -9,7 +9,7 @@ repository = "https://github.com/oliverrowebardeen/pigeon-relay"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "macros"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dashmap = "6"
 futures = "0.3"
