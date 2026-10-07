@@ -14,7 +14,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 dashmap = "6"
 futures = "0.3"
 hex = "0.4"
-hkdf = "0.12"
+hkdf = "0.13"
 humantime = "2"
 hmac = "0.12"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
