@@ -146,7 +146,8 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_MAX_CONNECTIONS` | `1024` | Global active WebSocket cap (1–65536); excess upgrades receive HTTP 503 |
 | `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |
 | `RELAY_MAX_MESSAGE_BYTES` | `65536` | Maximum envelope size |
-| `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap |
+| `RELAY_MAX_QUEUE_PER_RECIPIENT` | `500` | Per-recipient queue depth cap; excess enqueues receive `queue_full` |
+| `RELAY_MAX_TOTAL_QUEUED_BYTES` | `268435456` (256 MiB) | Global queue byte budget, including stored base64 strings and charged message/recipient bookkeeping; excess enqueues receive `queue_full` |
 | `RELAY_MAX_SESSION_SEND_QUEUE` | `128` | Per-websocket outbound buffer cap before the session is treated as stale |
 | `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
 | `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
@@ -219,10 +220,13 @@ Messages are stored in an in-memory queue keyed by recipient identity hash:
 
 - **TTL:** configured for the relay and applied when each message is queued (default 7 days)
 - **Deduplication:** duplicate IDs are suppressed while queued for the same recipient; delivery removes that deduplication entry, so retries can be delivered again
-- **Per-recipient cap:** oldest messages are dropped when the cap is exceeded
+- **Per-recipient cap:** new messages are rejected with `queue_full` when the cap is reached
+- **Global byte cap:** `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across all recipients, including bookkeeping for empty envelopes; uses the same `queue_full` error without evicting accepted messages
 - **Drain on connect:** the existing backlog is drained when a recipient authenticates; messages arriving during that drain can remain queued until the next authentication
 
-Delivery is best-effort, with no end-to-end acknowledgement or exactly-once guarantee. A completed WebSocket write does not prove that the client processed the message. The queue is not persisted to disk. A server restart clears all queued messages.
+Delivery is best-effort, with no end-to-end acknowledgement or exactly-once guarantee. A completed WebSocket write does not prove that the client processed the message. Socket delivery confirmations have bounded waits. Live delivery failures leave the message queued. Draining a queue releases its byte reservation; failed backlog deliveries are requeued only if capacity remains, otherwise dropped with a warning. Delivery, dequeue, and expiry release capacity, and empty recipient queues are removed.
+
+The byte budget charges string capacities and message, deduplication, and recipient bookkeeping. Allocator/container overhead, drained messages awaiting delivery, and buffers outside the queue mean it is not an exact process-memory limit. The queue is not persisted to disk. A server restart clears all queued messages.
 
 ## Testing
 
@@ -282,6 +286,6 @@ Configure your systemd unit with `EnvironmentFile=/etc/pigeon-relay/pigeon-relay
 
 ## Security and deployment limits
 
-See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions; it does not bound pre-upgrade TCP connections or total queued data across recipients. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
+See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions and `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients; neither bounds pre-upgrade TCP connections or total process memory. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
 
 CI uses the committed lockfile, checks the minimum Rust version, denies dependency advisories/warnings, and scans full Git history. APNS requests and socket delivery confirmations have bounded waits. `jsonwebtoken` uses the AWS-LC backend to avoid the unused RSA dependency previously present in the default RustCrypto backend.

@@ -523,11 +523,23 @@ async fn process_frame(
                 return false;
             }
 
-            let (queued, depth) = state.queue.enqueue(
+            let (queued, depth) = match state.queue.enqueue(
                 payload.recipient_hash_hex.clone(),
                 message_id,
                 payload.envelope_b64.clone(),
-            );
+            ) {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = send_error(
+                        out_tx,
+                        frame.req_id,
+                        "queue_full",
+                        "message queue capacity reached",
+                    )
+                    .await;
+                    return false;
+                }
+            };
 
             let accepted_payload = MessageAcceptedPayload {
                 message_id: payload.message_id.clone(),
@@ -772,7 +784,13 @@ async fn deliver_queued_messages(
         if let Err(error) = send_frame(sender, "msg_deliver", None, payload).await {
             let mut undelivered = vec![queued];
             undelivered.extend(queued_messages);
-            state.queue.requeue_messages(undelivered);
+            let dropped = state.queue.requeue_messages(undelivered);
+            if dropped > 0 {
+                warn!(
+                    dropped,
+                    "queue capacity reached; dropped undelivered messages"
+                );
+            }
             return Err(error);
         }
     }
@@ -1465,11 +1483,14 @@ mod tests {
         let backlog_ids = (0..BACKLOG_LEN)
             .map(|index| {
                 let message_id = Uuid::new_v4();
-                let (queued, depth) = state.queue.enqueue(
-                    identity_hash.clone(),
-                    message_id,
-                    STANDARD.encode(format!("backlog-{index}")),
-                );
+                let (queued, depth) = state
+                    .queue
+                    .enqueue(
+                        identity_hash.clone(),
+                        message_id,
+                        STANDARD.encode(format!("backlog-{index}")),
+                    )
+                    .unwrap();
                 assert!(queued);
                 assert_eq!(depth, index + 1);
                 message_id.to_string()
@@ -1616,11 +1637,14 @@ mod tests {
             .into_iter()
             .map(|label| {
                 let message_id = Uuid::new_v4();
-                let (queued, _) = state.queue.enqueue(
-                    identity_hash.clone(),
-                    message_id,
-                    STANDARD.encode(label.as_bytes()),
-                );
+                let (queued, _) = state
+                    .queue
+                    .enqueue(
+                        identity_hash.clone(),
+                        message_id,
+                        STANDARD.encode(label.as_bytes()),
+                    )
+                    .unwrap();
                 assert!(queued);
                 message_id.to_string()
             })
@@ -1791,6 +1815,68 @@ mod tests {
 
         let queued = state.queue.messages_for_recipient(&recipient_hash);
         assert_eq!(queued.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_limits_return_same_error_without_live_delivery() {
+        for global_limit in [false, true] {
+            let mut config = test_config(10);
+            config.max_queue_per_recipient = 1;
+            if global_limit {
+                config.max_total_queued_bytes = 1;
+            }
+            let state = Arc::new(RelayState::new(config, None));
+            let recipient = "b".repeat(64);
+            if !global_limit {
+                state
+                    .queue
+                    .enqueue(recipient.clone(), Uuid::new_v4(), STANDARD.encode(b"first"))
+                    .unwrap();
+            }
+            let (recipient_tx, mut recipient_rx) = mpsc::channel(4);
+            state.register_session(recipient.clone(), recipient_tx, Duration::from_secs(60));
+            let (out_tx, out_rx) = mpsc::channel(4);
+            let mut frames = spawn_confirming_writer(out_rx);
+            let mut identity = None;
+            let mut challenge = None;
+            let mut rate_key = "anon:test".to_string();
+            let mut last_pong = Instant::now();
+            let mut role = ConnectionRole::Send;
+            assert!(
+                !process_frame(
+                    &state,
+                    &out_tx,
+                    &mut identity,
+                    &mut challenge,
+                    &mut rate_key,
+                    &mut last_pong,
+                    &mut role,
+                    &false,
+                    ClientFrame {
+                        frame_type: "msg_send".to_string(),
+                        req_id: Some("capacity-test".to_string()),
+                        payload: json!({
+                            "message_id": Uuid::new_v4().to_string(),
+                            "recipient_hash_hex": recipient,
+                            "envelope_b64": STANDARD.encode(b"rejected"),
+                        }),
+                    },
+                )
+                .await
+            );
+            let response: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["req_id"], "capacity-test");
+            assert_eq!(response["payload"]["code"], "queue_full");
+            assert_eq!(
+                state.queue.depth_for(&recipient),
+                usize::from(!global_limit)
+            );
+            assert!(matches!(
+                recipient_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     async fn push_registration_result(topic: Option<&str>) -> (Value, Option<PushRegistration>) {
@@ -2391,6 +2477,7 @@ mod tests {
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
+            max_total_queued_bytes: 268_435_456,
             max_session_send_queue: 128,
             challenge_ttl: Duration::from_secs(30),
             session_ttl: Duration::from_secs(3600),

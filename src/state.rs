@@ -111,7 +111,11 @@ pub struct RelayState {
 
 impl RelayState {
     pub fn new(config: Config, apns_client: Option<Arc<ApnsClient>>) -> Self {
-        let queue = QueueStore::new(config.message_ttl, config.max_queue_per_recipient);
+        let queue = QueueStore::new(
+            config.message_ttl,
+            config.max_queue_per_recipient,
+            config.max_total_queued_bytes,
+        );
 
         Self {
             connection_slots: Arc::new(Semaphore::new(config.max_connections)),
@@ -270,6 +274,7 @@ mod tests {
             message_ttl: Duration::from_secs(3600),
             max_message_bytes: 65_536,
             max_queue_per_recipient: 500,
+            max_total_queued_bytes: 268_435_456,
             max_session_send_queue: 128,
             challenge_ttl: Duration::from_secs(30),
             session_ttl: Duration::from_secs(3600),

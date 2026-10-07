@@ -34,7 +34,7 @@ There is no monetary bug bounty. Reporters who prefer attribution are credited i
 - Anything in this repository: the relay binary, its protocol, dependencies pinned in `Cargo.lock`, CI configuration.
 - Cryptographic claims made in `README.md` (opaque envelope forwarding, sealed sender, accountless ECDH challenge-response, constant-time verification).
 - Issues that allow sender↔recipient correlation, identity recovery, message-content recovery, or unauthorized message delivery.
-- Resource exhaustion that is not bounded by the configured caps.
+- Resource exhaustion that bypasses configured caps or introduces unbounded protocol resource use, accounting for the known limitations below.
 
 **Out of scope (report to the respective project):**
 
@@ -58,3 +58,12 @@ The relay does **not** defend against:
 - A global passive network adversary correlating connections by timing (mitigation belongs at the transport layer, e.g. Tor).
 - Compromise of a client device (out of scope; the client is responsible for its own keys).
 - Misuse of the relay's identity model by clients that re-use keys across contexts.
+
+## Known Resource Limitations
+
+- `RELAY_MAX_CONNECTIONS` bounds upgraded WebSocket sessions, not pre-upgrade TCP/HTTP connections. Operators need connection and request limits at a TLS reverse proxy or network edge.
+- Unauthenticated (sealed-sender) send budgets are per connection and reset on reconnect. They are not a global abuse-prevention limit. Rate-limit tracking entries have time-based cleanup but no global entry-count cap, so rapid connection/identity churn can grow that map between cleanups.
+- APNS requests have timeouts and per-recipient cooldowns, but spawned push tasks have no global concurrency cap.
+- `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients, including bookkeeping for empty envelopes. It is not a process RSS limit: allocator/container overhead, drained messages awaiting delivery, and per-session outbound buffers are separate. Failed backlog deliveries can be dropped if concurrent enqueues consume the released capacity before requeueing. Queues are in memory and lost on restart.
+
+These limitations remain relevant to deployment and security reports; the new queue budget does not claim to prevent all denial of service.

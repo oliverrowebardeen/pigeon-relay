@@ -13,6 +13,7 @@ pub struct Config {
     pub message_ttl: Duration,
     pub max_message_bytes: usize,
     pub max_queue_per_recipient: usize,
+    pub max_total_queued_bytes: usize,
     pub max_session_send_queue: usize,
     pub challenge_ttl: Duration,
     pub session_ttl: Duration,
@@ -136,6 +137,8 @@ impl Config {
         let message_ttl = parse_duration(&get_var, "RELAY_MESSAGE_TTL", "168h")?;
         let max_message_bytes = parse_num(&get_var, "RELAY_MAX_MESSAGE_BYTES", "65536")?;
         let max_queue_per_recipient = parse_num(&get_var, "RELAY_MAX_QUEUE_PER_RECIPIENT", "500")?;
+        let max_total_queued_bytes =
+            parse_num(&get_var, "RELAY_MAX_TOTAL_QUEUED_BYTES", "268435456")?;
         let max_session_send_queue = parse_num(&get_var, "RELAY_MAX_SESSION_SEND_QUEUE", "128")?;
         let challenge_ttl = parse_duration(&get_var, "RELAY_CHALLENGE_TTL", "30s")?;
         let session_ttl = parse_duration(&get_var, "RELAY_SESSION_TTL", "24h")?;
@@ -152,6 +155,7 @@ impl Config {
 
         require_non_zero(&max_message_bytes)?;
         require_non_zero(&max_queue_per_recipient)?;
+        require_non_zero(&max_total_queued_bytes)?;
         require_non_zero(&max_session_send_queue)?;
         require_non_zero(&rate_limit_per_min)?;
         require_non_zero(&max_concurrent_challenges)?;
@@ -244,6 +248,7 @@ impl Config {
             message_ttl: message_ttl.value,
             max_message_bytes: max_message_bytes.value,
             max_queue_per_recipient: max_queue_per_recipient.value,
+            max_total_queued_bytes: max_total_queued_bytes.value,
             max_session_send_queue: max_session_send_queue.value,
             challenge_ttl: challenge_ttl.value,
             session_ttl: session_ttl.value,
@@ -428,6 +433,23 @@ mod tests {
         );
         for value in ["0", "65537", "-1", "invalid"] {
             assert!(config_from(&[("RELAY_MAX_CONNECTIONS", value)]).is_err());
+        }
+    }
+
+    #[test]
+    fn total_queue_byte_limit_validated() {
+        assert_eq!(
+            config_from(&[]).unwrap().max_total_queued_bytes,
+            268_435_456
+        );
+        assert_eq!(
+            config_from(&[("RELAY_MAX_TOTAL_QUEUED_BYTES", "1024")])
+                .unwrap()
+                .max_total_queued_bytes,
+            1024
+        );
+        for value in ["0", "-1", "invalid"] {
+            assert!(config_from(&[("RELAY_MAX_TOTAL_QUEUED_BYTES", value)]).is_err());
         }
     }
 
