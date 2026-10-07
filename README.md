@@ -126,7 +126,7 @@ cp .env.example .env
 ./scripts/dev-run.sh
 ```
 
-The development script binds to `127.0.0.1:8080` unless `RELAY_ADDR` is set and exports variables from `.env`. It sources that file as shell code: use only a file you trust.
+The development script binds to `127.0.0.1:8080` unless `RELAY_ADDR` is set and exports variables from `.env`. It sources that file as shell code using `set -a` to export assignments: use only a file you trust. The example sets `RUST_LOG=pigeon_relay=info` so startup and operational messages are visible; the logging target uses an underscore.
 
 For direct execution, export any configuration variables and run `cargo run --release --locked`. The binary itself defaults to `0.0.0.0:8080` and does not load `.env`.
 
@@ -138,10 +138,11 @@ curl http://127.0.0.1:8080/healthz
 
 ## Configuration
 
-All configuration is via environment variables with sensible defaults:
+All configuration is via environment variables. [.env.example](.env.example) lists every supported setting and uses loopback with APNS disabled for local development. Replace the example APNS identifiers, topic, and key paths with your own before enabling push. Apart from the listen address and logging filter, its active relay settings match the built-in defaults below:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `RUST_LOG` | `error` | Tracing filter; the example uses `pigeon_relay=info` for startup and operational logs |
 | `RELAY_ADDR` | `0.0.0.0:8080` | Listen address |
 | `RELAY_MAX_CONNECTIONS` | `1024` | Global active WebSocket cap (1–65536); excess upgrades receive HTTP 503 |
 | `RELAY_MESSAGE_TTL` | `168h` | How long queued messages are retained |

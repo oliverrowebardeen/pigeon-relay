@@ -25,7 +25,7 @@ cp .env.example .env
 ./scripts/dev-run.sh
 ```
 
-The development script exports `.env` values and defaults to `127.0.0.1:8080`. It sources `.env` as shell code, so only use a file you trust. The binary itself does not read `.env` and defaults to `0.0.0.0:8080` when run directly. To verify it is running:
+The development script exports `.env` assignments using `set -a` and defaults to `127.0.0.1:8080`. It sources `.env` as shell code, so only use a file you trust. [.env.example](.env.example) lists every relay and APNS setting, selects `RUST_LOG=pigeon_relay=info` for startup logs, and keeps APNS disabled. Replace its placeholder APNS identifiers, topic, and key paths before enabling push. See the [configuration reference](README.md#configuration) for defaults and limits. The binary itself does not read `.env` and defaults to `0.0.0.0:8080` when run directly. To verify it is running:
 
 ```sh
 curl http://127.0.0.1:8080/healthz
