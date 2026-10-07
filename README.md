@@ -172,8 +172,11 @@ When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offli
 | `APNS_SANDBOX_PRIVATE_KEY_PATH` | Sandbox-specific key path |
 | `APNS_PRODUCTION_KEY_ID` | Production-specific key ID (overrides default) |
 | `APNS_PRODUCTION_PRIVATE_KEY_PATH` | Production-specific key path |
-| `APNS_TOPIC` | App bundle ID |
+| `APNS_TOPIC` | Default app bundle ID; always allowed and used when registration omits `topic` |
+| `APNS_ALLOWED_TOPICS` | Optional comma-separated additional allowed bundle IDs; whitespace is trimmed and empty entries ignored |
 | `APNS_ENV` | `sandbox` or `production` (default `sandbox`) |
+
+A `push_register` topic must be in `APNS_TOPIC` or `APNS_ALLOWED_TOPICS`; other topics are rejected with `bad_payload` without storing the registration.
 
 Use `production` for TestFlight and App Store builds. Use `sandbox` for debug builds installed from Xcode.
 

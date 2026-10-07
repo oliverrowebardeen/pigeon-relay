@@ -290,6 +290,7 @@ mod tests {
                 production_key_id: None,
                 production_private_key_path: None,
                 topic: None,
+                allowed_topics: Default::default(),
                 environment: ApnsEnvironment::Sandbox,
             },
         }

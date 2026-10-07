@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::str::FromStr;
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub struct ApnsConfig {
     pub production_key_id: Option<String>,
     pub production_private_key_path: Option<String>,
     pub topic: Option<String>,
+    pub allowed_topics: HashSet<String>,
     pub environment: ApnsEnvironment,
 }
 
@@ -166,6 +168,18 @@ impl Config {
             });
         }
 
+        let apns_topic = get_var("APNS_TOPIC")
+            .map(|topic| topic.trim().to_string())
+            .filter(|topic| !topic.is_empty());
+        let mut allowed_topics: HashSet<String> = get_var("APNS_ALLOWED_TOPICS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .map(str::to_string)
+            .collect();
+        allowed_topics.extend(apns_topic.iter().cloned());
+
         let apns = ApnsConfig {
             enabled: apns_enabled,
             team_id: get_var("APNS_TEAM_ID"),
@@ -175,7 +189,8 @@ impl Config {
             sandbox_private_key_path: get_var("APNS_SANDBOX_PRIVATE_KEY_PATH"),
             production_key_id: get_var("APNS_PRODUCTION_KEY_ID"),
             production_private_key_path: get_var("APNS_PRODUCTION_PRIVATE_KEY_PATH"),
-            topic: get_var("APNS_TOPIC"),
+            topic: apns_topic,
+            allowed_topics,
             environment: apns_environment,
         };
 
@@ -447,6 +462,33 @@ mod tests {
         let err =
             config_from(&[("APNS_ENV", "staging")]).expect_err("unknown apns env should fail");
         assert!(matches!(err, ConfigError::InvalidApnsEnvironment(_)));
+    }
+
+    #[test]
+    fn apns_topics_include_default_and_trimmed_nonempty_extras() {
+        let config = config_from(&[
+            ("APNS_TOPIC", "com.example.pigeon"),
+            (
+                "APNS_ALLOWED_TOPICS",
+                " , com.example.pigeon.beta, , com.example.pigeon.beta ,",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.apns.allowed_topics,
+            HashSet::from([
+                "com.example.pigeon".to_string(),
+                "com.example.pigeon.beta".to_string(),
+            ])
+        );
+        assert!(config_from(&[]).unwrap().apns.allowed_topics.is_empty());
+        assert_eq!(
+            config_from(&[("APNS_TOPIC", "com.example.pigeon")])
+                .unwrap()
+                .apns
+                .allowed_topics,
+            HashSet::from(["com.example.pigeon".to_string()])
+        );
     }
 
     #[test]
