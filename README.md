@@ -162,7 +162,7 @@ All configuration is via environment variables. [.env.example](.env.example) lis
 
 ### APNS Configuration
 
-When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offline recipients:
+When `APNS_ENABLED=true`, the relay sends silent background pushes to wake offline recipients. APNS connections time out after 5 seconds and requests after 10 seconds:
 
 | Variable | Description |
 |----------|-------------|
@@ -250,31 +250,42 @@ CI runs on every push and pull request:
 
 ## Deployment
 
-On Linux, you can run the relay as a systemd service. No `.service` file is included: create one for your environment, with TLS termination and reverse-proxy limits as described below. The following paths are examples; keep configuration and signing keys outside the repository.
+For a Linux deployment, build with `cargo build --release --locked`, install `target/release/pigeon-relay` as `/usr/local/bin/pigeon-relay`, and create a dedicated `pigeon-relay` service account. Bind the relay to loopback and put a reverse proxy with TLS in front of it. For example, adapt this [Caddy reverse-proxy configuration](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy) for a hostname you control:
 
-**Server layout:**
-
-```
-/opt/pigeon-relay/          # git clone of this repo
-/etc/pigeon-relay/
-  pigeon-relay.env          # environment variables (secrets, config)
-  AuthKey_*.p8              # APNS signing keys (chmod 600)
+```caddyfile
+relay.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
 ```
 
-**Update from a new push:**
+Point the hostname at your server and configure connection and request limits at your proxy or network edge for your workload. Clients connect to `wss://relay.example.com/v1/ws`. Keep the relay's port inaccessible from the public network. This minimal proxy example does not configure abuse-prevention limits.
 
-```bash
-cd /opt/pigeon-relay
-git pull origin main
-source "$HOME/.cargo/env"
-cargo build --release --locked
-systemctl restart pigeon-relay
-systemctl status pigeon-relay   # verify it started
+Example `/etc/systemd/system/pigeon-relay.service` (adapt the service account and installation paths to your host):
+
+```ini
+[Unit]
+Description=Pigeon WebSocket relay
+After=network.target
+
+[Service]
+User=pigeon-relay
+Group=pigeon-relay
+ExecStart=/usr/local/bin/pigeon-relay
+Environment=RELAY_ADDR=127.0.0.1:8080
+Environment=RUST_LOG=pigeon_relay=info
+EnvironmentFile=-/etc/pigeon-relay/relay.conf
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-Configure your systemd unit with `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to load configuration at startup. The `.env` file in the repo directory is for local development only and is never committed.
+Store optional `KEY=value` environment overrides in `/etc/pigeon-relay/relay.conf`, outside the checkout. Use literal values rather than shell commands: systemd does not source this file as a shell script. See the [systemd environment reference](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=). Keep APNS signing keys outside the repository, restrict their permissions, and make them readable only by the service account and administrators. The local development `.env` file is never committed.
 
-**Note:** Restarting the service drops all active WebSocket connections and clears the in-memory message queue. Clients must reconnect and retry as appropriate.
+After installing or updating the unit, run `sudo systemctl daemon-reload` and `sudo systemctl enable --now pigeon-relay`. For binary updates, install the new build, run `sudo systemctl restart pigeon-relay`, and verify `sudo systemctl status pigeon-relay` plus the `/healthz` endpoint. View logs with `sudo journalctl -u pigeon-relay`.
+
+The relay handles Ctrl-C and, on Unix, SIGTERM through its server shutdown path. Stopping or restarting the service drops active WebSocket connections and clears the in-memory queue; clients must reconnect and retry as appropriate. Shutdown does not persist or guarantee delivery of pending messages.
 
 ## Related
 
