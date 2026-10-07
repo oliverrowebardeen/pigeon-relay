@@ -33,4 +33,4 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
