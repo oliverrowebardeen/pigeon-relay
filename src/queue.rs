@@ -116,13 +116,24 @@ impl QueueStore {
 
         let bytes = message.queued_bytes();
         // Reserve atomically across shards before adding to any recipient queue.
-        self.total_queued_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                total
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.max_total_queued_bytes)
-            })
-            .map_err(|_| QueueFull)?;
+        // An explicit CAS loop builds warning-free on both the MSRV and current
+        // stable, where `fetch_update` is deprecated in favor of `try_update`.
+        let mut total = self.total_queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = total
+                .checked_add(bytes)
+                .filter(|next| *next <= self.max_total_queued_bytes)
+                .ok_or(QueueFull)?;
+            match self.total_queued_bytes.compare_exchange_weak(
+                total,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => total = actual,
+            }
+        }
         queue.queued_bytes += bytes;
         queue.dedup.insert(message.message_id, message.expires_at);
         queue.messages.push_back(message);
