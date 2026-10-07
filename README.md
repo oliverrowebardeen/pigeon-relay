@@ -23,7 +23,7 @@ The relay forwards base64 envelopes addressed by recipient public-key hash. It h
           +----------> [ Relay ] <------------+
           |         (opaque box)              |
           |                                   |
-          |   Anonymous send conn             |
+          |   Unauthenticated send conn       |
           |   msg_send(envelope_b64)          |
           +----------> [ Queue ] ------------>+
           |         never decrypted       msg_deliver
@@ -41,7 +41,7 @@ The relay forwards base64 envelopes addressed by recipient public-key hash. It h
      Phone C (BLE-only) --> BLE --> Phone B (bridge) --> WS --> Relay --> Phone A
 ```
 
-Pigeon clients are expected to encrypt envelopes before sending them to the relay. The server also sees routing and connection metadata, including recipient hashes, network addresses, timing, and sizes. It does not validate the client encryption scheme.
+Pigeon clients are expected to encrypt envelopes before sending them to the relay. The server also sees routing and connection metadata, including authentication public keys, recipient hashes, network addresses, timing, sizes, and APNS device tokens when push is enabled. It does not validate the client encryption scheme.
 
 ## Key Design Decisions
 
@@ -152,7 +152,7 @@ All configuration is via environment variables. [.env.example](.env.example) lis
 | `RELAY_MAX_SESSION_SEND_QUEUE` | `128` | Per-websocket outbound buffer cap before the session is treated as stale |
 | `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
 | `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
-| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per authenticated identity or anonymous connection (see below) |
+| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per authenticated identity or unauthenticated connection (see below) |
 | `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
 | `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
 | `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
@@ -195,14 +195,14 @@ The push payload is a silent background notification:
 
 Rate limiting is scoped to prevent abuse while supporting bridge mode:
 
-- **Send connections (anonymous):** per WebSocket connection (`anon:<connection-id>`)
+- **Unauthenticated (sealed-sender) send connections:** per WebSocket connection (`anon:<connection-id>`)
 - **Receive connections (authenticated):** per identity hash after authentication, per connection before
 
 This means multiple BLE-only peers tunneled through a single bridge phone each get their own rate limit budget, rather than sharing one.
 
 ## Legacy Compatibility
 
-`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated anonymous send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
+`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated unauthenticated (sealed-sender) send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
 
 Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older clients that have not yet migrated.
 
@@ -287,6 +287,6 @@ Configure your systemd unit with `EnvironmentFile=/etc/pigeon-relay/pigeon-relay
 
 ## Security and deployment limits
 
-See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions and `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients; neither bounds pre-upgrade TCP connections or total process memory. Anonymous send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
+See [SECURITY.md](SECURITY.md). This experimental implementation has automated tests and dependency checks, but no independent cryptographic audit. Public-facing deployments need TLS termination plus connection and request limits at the reverse proxy. The global WebSocket cap bounds simultaneous sessions and `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients; neither bounds pre-upgrade TCP connections or total process memory. Unauthenticated send budgets are per connection and can be reset by reconnecting; they are not an abuse-prevention system. Configure message/queue caps, monitor memory, and test limits for your workload. The relay currently stores queues in memory; restart loses pending messages.
 
 CI uses the committed lockfile, checks the minimum Rust version, denies dependency advisories/warnings, and scans full Git history. APNS requests and socket delivery confirmations have bounded waits. `jsonwebtoken` uses the AWS-LC backend to avoid the unused RSA dependency previously present in the default RustCrypto backend.

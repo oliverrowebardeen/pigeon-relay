@@ -51,7 +51,7 @@ There is no monetary bug bounty. Reporters who prefer attribution are credited i
 
 ## Threat Model Summary
 
-The relay is designed under the assumption that the operator and the server itself are **untrusted by clients**. Clients do not rely on the relay for confidentiality, authenticity, or sender privacy beyond what the protocol enforces. The relay sees ciphertext, recipient identity hashes, source network addresses, connection timing, and message sizes. Send sockets omit authenticated sender identity, but traffic analysis can still correlate send and receive connections. Content disclosure or violations of the documented authentication boundary are in scope.
+The relay is designed under the assumption that the operator and the server itself are **untrusted by clients**. Clients do not rely on the relay for confidentiality, authenticity, or sender privacy beyond what the protocol enforces. The relay sees opaque envelopes, authentication public keys, recipient identity hashes, source network addresses, connection timing, message sizes, and APNS device tokens when push is enabled. Send sockets omit authenticated sender identity, but traffic analysis can still correlate send and receive connections. Content disclosure or violations of the documented authentication boundary are in scope.
 
 The relay does **not** defend against:
 
