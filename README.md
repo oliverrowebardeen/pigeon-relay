@@ -6,7 +6,7 @@ The relay forwards base64 envelopes addressed by recipient public-key hash. It h
 
 **Experimental and not independently security-audited.** Do not rely on this relay for sensitive communications. See [security and deployment limits](#security-and-deployment-limits).
 
-**Pigeon is pre-beta; no TestFlight build is currently available.** Developers can build the [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) from source. Bluetooth testing requires physical iPhones.
+The [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) is built from source. Bluetooth testing requires physical iPhones.
 
 ## Architecture
 
@@ -202,9 +202,9 @@ This means multiple BLE-only peers tunneled through a single bridge phone each g
 
 ## Legacy Compatibility
 
-`RELAY_ALLOW_LEGACY_SEND` now defaults to `false`. Modern Pigeon clients use a dedicated unauthenticated (sealed-sender) send socket even in bridge mode, so authenticated receive sockets no longer need to accept `msg_send`.
+`RELAY_ALLOW_LEGACY_SEND` defaults to `false`. Pigeon clients use a dedicated unauthenticated (sealed-sender) send socket even in bridge mode, so authenticated receive sockets do not accept `msg_send`.
 
-Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older clients that have not yet migrated.
+Set `RELAY_ALLOW_LEGACY_SEND=true` only to support older clients that send `msg_send` on the authenticated socket. Doing so lets the relay associate those sends with the sender's authenticated identity.
 
 ## Bridge / NAT Behavior
 
