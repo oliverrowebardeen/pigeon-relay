@@ -1,7 +1,11 @@
 /target
 .env
 .env.*
+!.env.example
 .DS_Store
 *.p8
 *.pem
 *.key
+*.p12
+*.pfx
+*.mobileprovision
