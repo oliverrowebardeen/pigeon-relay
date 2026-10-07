@@ -16,14 +16,14 @@ References #
 ## Testing
 
 - [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --all-targets --all-features`
+- [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
+- [ ] `cargo test --all-targets --all-features --locked`
 - [ ] Manually exercised the changed path (describe how)
 
 ## Security & Protocol Impact
 
 - [ ] No protocol change (frame types, payload fields, role assignment) — or describe below.
-- [ ] No change to zero-knowledge / sealed-sender properties — or describe below.
+- [ ] No change to documented confidentiality, authentication, or metadata exposure — or describe below.
 - [ ] No new `unsafe` blocks.
 - [ ] No new dependencies, or new dependencies justified below.
 

@@ -2,7 +2,9 @@
 
 A WebSocket relay server for opaque encrypted envelopes for [Pigeon](https://github.com/oliverrowebardeen/pigeon-ios) -- an end-to-end encrypted messenger that communicates over BLE mesh, internet relay, or both.
 
-The relay never decrypts, inspects, or logs message contents. It stores and forwards encrypted envelopes addressed by recipient public-key hash. There are no accounts, no usernames, no passwords -- identity is a Curve25519 keypair.
+The relay forwards base64 envelopes addressed by recipient public-key hash. It has no message decryption keys and does not log envelope payloads. Clients are responsible for encrypting and authenticating their contents; the relay cannot verify that an envelope is encrypted. There are no accounts, usernames, or passwords: receive identity is a Curve25519 keypair.
+
+**Experimental and not independently security-audited.** Do not rely on this relay for sensitive communications. See [security and deployment limits](#security-and-deployment-limits).
 
 **Pigeon is pre-beta; no TestFlight build is currently available.** Developers can build the [iOS client](https://github.com/oliverrowebardeen/pigeon-ios) from source. Bluetooth testing requires physical iPhones.
 
@@ -39,7 +41,7 @@ The relay never decrypts, inspects, or logs message contents. It stores and forw
      Phone C (BLE-only) --> BLE --> Phone B (bridge) --> WS --> Relay --> Phone A
 ```
 
-Every message between clients is encrypted end-to-end with AES-256-GCM before it reaches the relay. The relay sees only opaque base64 blobs and identity hashes -- never plaintext, never sender names, never message content.
+Pigeon clients are expected to encrypt envelopes before sending them to the relay. The server also sees routing and connection metadata, including recipient hashes, network addresses, timing, and sizes. It does not validate the client encryption scheme.
 
 ## Key Design Decisions
 
@@ -47,7 +49,7 @@ Every message between clients is encrypted end-to-end with AES-256-GCM before it
 
 **Accountless authentication.** Clients authenticate using their existing Curve25519 keypair via ECDH challenge-response. The server generates an ephemeral X25519 keypair per challenge, derives a shared secret via HKDF-SHA256, and the client proves possession of its private key with an HMAC proof. No registration, no email, no phone number.
 
-**Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+**Constant-time verification.** Auth proofs are compared using `subtle::ConstantTimeEq` for the fixed-size proof comparison.
 
 **Sealed sender.** The send protocol omits the sender identity. Receive connections are authenticated solely for delivery routing. `msg_deliver` contains the encrypted envelope, message ID, and timestamp. This reduces exposed protocol metadata; it does not stop a relay operator or network observer from correlating traffic.
 
@@ -84,7 +86,7 @@ Client                          Relay
 
 WebSocket endpoint: `/v1/ws`
 
-Connections have a **role** determined by their first frame: `auth_hello` assigns the **receive** role, `msg_send` assigns the **send** role. Roles are immutable for the lifetime of the connection.
+Connections have a **role** determined by their first non-keepalive frame: `auth_hello` assigns the **receive** role, `msg_send` assigns the **send** role. Roles are immutable for the lifetime of the connection.
 
 All frames are JSON with a `type` field:
 
@@ -108,23 +110,25 @@ All frames are JSON with a `type` field:
 **Prerequisites:**
 - Rust 1.88+ (this project uses edition 2024)
 - Git
+- A C/C++ build toolchain and CMake for the AWS-LC cryptography dependency
 
 ```bash
 git clone https://github.com/oliverrowebardeen/pigeon-relay.git
 cd pigeon-relay
-cargo build --release
+cargo build --release --locked
 ```
 
 ## Running
 
 ```bash
-# Optional: configure via environment variables (see below)
-source .env 2>/dev/null || true
-
-cargo run --release
+# Optional: copy and edit the local configuration
+cp .env.example .env
+./scripts/dev-run.sh
 ```
 
-Default bind: `0.0.0.0:8080`
+The development script binds to `127.0.0.1:8080` unless `RELAY_ADDR` is set and exports variables from `.env`. It sources that file as shell code: use only a file you trust.
+
+For direct execution, export any configuration variables and run `cargo run --release --locked`. The binary itself defaults to `0.0.0.0:8080` and does not load `.env`.
 
 Health check:
 
@@ -146,7 +150,7 @@ All configuration is via environment variables with sensible defaults:
 | `RELAY_MAX_SESSION_SEND_QUEUE` | `128` | Per-websocket outbound buffer cap before the session is treated as stale |
 | `RELAY_CHALLENGE_TTL` | `30s` | Auth challenge expiry |
 | `RELAY_SESSION_TTL` | `24h` | Authenticated session expiry |
-| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per identity |
+| `RELAY_RATE_LIMIT_PER_MIN` | `60` | Requests per minute per authenticated identity or anonymous connection (see below) |
 | `RELAY_PING_INTERVAL` | `25s` | Server-initiated ping interval |
 | `RELAY_PONG_TIMEOUT` | `60s` | Close connection if no pong received |
 | `RELAY_MAX_CHALLENGES` | `10000` | Maximum concurrent pending auth challenges |
@@ -210,12 +214,12 @@ Only set `RELAY_ALLOW_LEGACY_SEND=true` as a temporary rollback valve for older 
 
 Messages are stored in an in-memory queue keyed by recipient identity hash:
 
-- **TTL:** configurable per message (default 7 days)
-- **Deduplication:** same message ID to same recipient is only queued once
+- **TTL:** configured for the relay and applied when each message is queued (default 7 days)
+- **Deduplication:** duplicate IDs are suppressed while queued for the same recipient; delivery removes that deduplication entry, so retries can be delivered again
 - **Per-recipient cap:** oldest messages are dropped when the cap is exceeded
-- **Drain on connect:** queued messages are delivered immediately when a recipient authenticates
+- **Drain on connect:** the existing backlog is drained when a recipient authenticates; messages arriving during that drain can remain queued until the next authentication
 
-The queue is not persisted to disk. A server restart clears all queued messages.
+Delivery is best-effort, with no end-to-end acknowledgement or exactly-once guarantee. A completed WebSocket write does not prove that the client processed the message. The queue is not persisted to disk. A server restart clears all queued messages.
 
 ## Testing
 
@@ -229,14 +233,16 @@ Tests include integration tests that stand up a real WebSocket server and perfor
 
 CI runs on every push and pull request:
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`
 - `cargo test --all-targets --all-features --locked`
 - `cargo deny check advisories bans licenses sources`
-- `gitleaks`
+- `cargo audit --deny warnings`
+- `cargo +1.88.0 check --all-targets --locked`
+- `gitleaks git . --log-opts="--all" --redact`
 
 ## Deployment
 
-The relay is designed to run as a systemd service. No `.service` file is included -- create one for your environment. Configuration and secrets live outside the repo in `/etc/pigeon-relay/`.
+On Linux, you can run the relay as a systemd service. No `.service` file is included: create one for your environment, with TLS termination and reverse-proxy limits as described below. The following paths are examples; keep configuration and signing keys outside the repository.
 
 **Server layout:**
 
@@ -253,14 +259,14 @@ The relay is designed to run as a systemd service. No `.service` file is include
 cd /opt/pigeon-relay
 git pull origin main
 source "$HOME/.cargo/env"
-cargo build --release
+cargo build --release --locked
 systemctl restart pigeon-relay
 systemctl status pigeon-relay   # verify it started
 ```
 
-The systemd unit uses `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to load secrets at startup. The `.env` file in the repo directory is for local development only and is never committed.
+Configure your systemd unit with `EnvironmentFile=/etc/pigeon-relay/pigeon-relay.env` to load configuration at startup. The `.env` file in the repo directory is for local development only and is never committed.
 
-**Note:** Restarting the service drops all active WebSocket connections and clears the in-memory message queue. Connected clients will reconnect automatically.
+**Note:** Restarting the service drops all active WebSocket connections and clears the in-memory message queue. Clients must reconnect and retry as appropriate.
 
 ## Related
 

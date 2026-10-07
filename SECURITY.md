@@ -6,20 +6,20 @@
 
 **Do not open public GitHub issues for security problems.**
 
-Email **security@example.com** with:
+Use GitHub's [private vulnerability reporting](https://github.com/oliverrowebardeen/pigeon-relay/security/advisories/new) with:
 
 - A description of the issue and the impact you believe it has.
 - Steps to reproduce, or a proof-of-concept if you have one.
 - The affected commit hash or release tag.
 - Whether the issue is exploitable against a deployed relay or only a local build.
 
-You will get an acknowledgement within **72 hours**. If you do not, please follow up — the email may have been missed.
+We aim to acknowledge reports within **72 hours**, but response times are not guaranteed.
 
-GitHub's [private vulnerability reporting](https://github.com/oliverrowebardeen/pigeon-relay/security/advisories/new) is also enabled and is an acceptable alternative channel.
+If the private reporting form is unavailable, open an issue asking the maintainer to enable private vulnerability reporting. Include **no vulnerability details, exploit code, personal information, or credentials** in that public request. Wait for a private channel before sending the report.
 
 ## Disclosure Process
 
-1. Acknowledge the report (≤ 72 hours).
+1. Acknowledge the report (target: 72 hours).
 2. Confirm or refute the issue and assess severity.
 3. Develop a fix in a private branch.
 4. Coordinate a disclosure timeline with the reporter (default: 90 days from acknowledgement, or sooner if a fix ships).

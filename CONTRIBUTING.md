@@ -7,23 +7,25 @@ Thank you for your interest in contributing to pigeon-relay. This document cover
 **Prerequisites:**
 
 - Rust 1.88 or later (the project uses edition 2024)
-- git
+- Git
+- A C/C++ build toolchain and CMake for AWS-LC
 
 **Build from source:**
 
 ```sh
 git clone https://github.com/oliverrowebardeen/pigeon-relay.git
 cd pigeon-relay
-cargo build --release
+cargo build --release --locked
 ```
 
 ## Running Locally
 
 ```sh
-source .env 2>/dev/null || true && cargo run --release
+cp .env.example .env
+./scripts/dev-run.sh
 ```
 
-The server binds to `0.0.0.0:8080` by default. To verify it is running:
+The development script exports `.env` values and defaults to `127.0.0.1:8080`. It sources `.env` as shell code, so only use a file you trust. The binary itself does not read `.env` and defaults to `0.0.0.0:8080` when run directly. To verify it is running:
 
 ```sh
 curl http://127.0.0.1:8080/healthz
@@ -32,7 +34,7 @@ curl http://127.0.0.1:8080/healthz
 ## Running Tests
 
 ```sh
-cargo test --all-targets --all-features
+cargo test --all-targets --all-features --locked
 ```
 
 ## Code Style
@@ -41,7 +43,7 @@ All code must pass both of the following checks:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 CI enforces both. Please run them locally before pushing.
@@ -79,5 +81,5 @@ Open an issue and include:
 
 ## Security
 
-If you discover a security vulnerability, please do **not** open a public issue. Instead, email **security@example.com** with details so it can be addressed privately.
+If you discover a security vulnerability, please do **not** open a public issue. Use the private reporting route in [SECURITY.md](SECURITY.md).
 
