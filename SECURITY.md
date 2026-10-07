@@ -13,13 +13,13 @@ Use GitHub's [private vulnerability reporting](https://github.com/oliverrowebard
 - The affected commit hash or release tag.
 - Whether the issue is exploitable against a deployed relay or only a local build.
 
-We aim to acknowledge reports within **72 hours**, but response times are not guaranteed.
+Reports are handled on a best-effort basis without a guaranteed response time.
 
 If the private reporting form is unavailable, open an issue asking the maintainer to enable private vulnerability reporting. Include **no vulnerability details, exploit code, personal information, or credentials** in that public request. Wait for a private channel before sending the report.
 
 ## Disclosure Process
 
-1. Acknowledge the report (target: 72 hours).
+1. Acknowledge the report.
 2. Confirm or refute the issue and assess severity.
 3. Develop a fix in a private branch.
 4. Coordinate a disclosure timeline with the reporter (default: 90 days from acknowledgement, or sooner if a fix ships).
@@ -66,4 +66,4 @@ The relay does **not** defend against:
 - APNS requests have timeouts and per-recipient cooldowns, but spawned push tasks have no global concurrency cap.
 - `RELAY_MAX_TOTAL_QUEUED_BYTES` bounds charged queue storage across recipients, including bookkeeping for empty envelopes. It is not a process RSS limit: allocator/container overhead, drained messages awaiting delivery, and per-session outbound buffers are separate. Failed backlog deliveries can be dropped if concurrent enqueues consume the released capacity before requeueing. Queues are in memory and lost on restart.
 
-These limitations remain relevant to deployment and security reports; the new queue budget does not claim to prevent all denial of service.
+These limitations remain relevant to deployment and security reports; the queue budget does not claim to prevent all denial of service.
